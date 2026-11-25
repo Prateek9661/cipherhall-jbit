@@ -1,0 +1,6 @@
+{
+  "name": "CipherHall",
+  "description": "Next-Gen Encrypted File & Chat Vault for college students and faculty with live cryptographic inspection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
