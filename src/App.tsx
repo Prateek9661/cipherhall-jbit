@@ -33,9 +33,20 @@ import {
   encryptPayloadWithWebCrypto,
   generateUserKeyBundle,
   hydrateRecipientsWithRealKeys,
+  importPublicKeyFromJwk,
   updateFileRecipientAccess,
   verifyFileIntegrity,
 } from './utils/cryptoEngine';
+import {
+  checkHealth,
+  fetchCampusDirectory,
+  fetchVaultFiles,
+  logout,
+  pushKeyMaterial,
+  sendEncryptedMessage,
+  updateFileAccess,
+  type ApiVaultFile,
+} from './utils/apiClient';
 
 function shouldAutostartWorkspace(): boolean {
   if (typeof window === 'undefined') return false;
@@ -116,6 +127,70 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  // ── API: fetch real campus directory (overwrites mock when server is reachable) ──
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    import('./utils/apiClient').then(({ fetchCampusDirectory }) =>
+      fetchCampusDirectory()
+    ).then(async (apiRecipients) => {
+      if (cancelled) return;
+      const { importPublicKeyFromJwk } = await import('./utils/cryptoEngine');
+      const hydrated: Recipient[] = await Promise.all(
+        apiRecipients.map(async (r) => {
+          let pubKey: CryptoKey | undefined;
+          if (r.publicKeyJwk) {
+            try { pubKey = await importPublicKeyFromJwk(r.publicKeyJwk); } catch { /* skip */ }
+          }
+          return {
+            id: r.id,
+            name: r.name,
+            email: r.email,
+            role: r.role,
+            department: r.department,
+            keyFingerprint: r.keyFingerprint,
+            publicKey: pubKey,
+          };
+        })
+      );
+      if (!cancelled) setRecipients(hydrated);
+    }).catch(() => { /* server not reachable – keep local mock directory */ });
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
+  // ── API: load vault files from server on login ────────────────────────────────
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    import('./utils/apiClient').then(({ fetchVaultFiles }) =>
+      fetchVaultFiles()
+    ).then((apiFiles) => {
+      if (cancelled) return;
+      const mapped: VaultFile[] = apiFiles.map((f) => ({
+        id: f.id,
+        filename: f.filename,
+        fileType: f.fileType,
+        mimeType: f.mimeType,
+        sizeBytes: f.sizeBytes,
+        uploadedBy: f.uploadedBy,
+        uploadedByRole: f.uploadedByRole,
+        department: f.department,
+        uploadedAt: f.uploadedAt,
+        dateLabel: new Date(f.uploadedAt).toLocaleDateString('en-IN', {
+          day: 'numeric', month: 'short', year: 'numeric',
+        }),
+        sha256Status: f.sha256Status,
+        decryptedPreviewContent: '',
+        recipients: f.recipients,
+        crypto: f.crypto as VaultFile['crypto'],
+      }));
+      const serverIds = new Set(mapped.map((f) => f.id));
+      const localOnly = INITIAL_VAULT_FILES.filter((f) => !serverIds.has(f.id));
+      if (!cancelled) setFiles([...mapped, ...localOnly]);
+    }).catch(() => { /* server not reachable – keep local demo files */ });
+    return () => { cancelled = true; };
+  }, [user?.id]);
 
   // When autostart=1 is used, generate a real RSA-OAEP-2048 key pair & PBKDF2-protected private key for the demo session
   useEffect(() => {
@@ -212,7 +287,10 @@ export default function App() {
   };
 
   const handleSignOut = () => {
+    // Clear JWT from sessionStorage so the next session starts fresh
+    import('./utils/apiClient').then(({ logout }) => logout()).catch(() => {});
     setUser(null);
+    setFiles(INITIAL_VAULT_FILES);
     setUploadModalOpen(false);
     setSecurityModalOpen(false);
     setManageAccessFile(null);
@@ -250,6 +328,15 @@ export default function App() {
     if (inspectorTarget?.kind === 'file' && inspectorTarget.file.id === file.id) {
       setInspectorTarget({ kind: 'file', file: updatedFile });
     }
+
+    // ── Persist access change to server (best-effort, non-blocking) ──
+    import('./utils/apiClient').then(({ updateFileAccess }) =>
+      updateFileAccess(file.id, {
+        recipients: updatedFile.recipients,
+        authorizedUserIds: [], // server resolves by name for now; can pass IDs later
+        cryptoEnvelope: updatedFile.crypto,
+      })
+    ).catch(() => { /* non-critical: local state already updated */ });
 
     const parts: string[] = [];
     if (revokedNames.length > 0) {
@@ -392,6 +479,19 @@ export default function App() {
       status: 'info',
       statusLabel: 'Encrypted',
     });
+
+    // ── Persist encrypted message to server (best-effort) ──
+    // The peer recipient is the first non-self participant.
+    const peerRecipient = effectiveThreadRecipients.find((r) => r.id !== user.id);
+    if (peerRecipient) {
+      import('./utils/apiClient').then(({ sendEncryptedMessage }) =>
+        sendEncryptedMessage({
+          recipientId: peerRecipient.id,
+          cryptoEnvelope: envelope,
+          attachedFileId: attachedFile?.id ?? null,
+        })
+      ).catch(() => { /* non-critical: local state already updated */ });
+    }
   };
 
   const handleDownloadVaultFileFromChat = async (

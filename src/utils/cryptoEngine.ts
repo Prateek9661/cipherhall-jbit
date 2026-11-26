@@ -229,6 +229,8 @@ export interface GeneratedUserKeyMaterial {
   privateKey: CryptoKey;
   keyFingerprint: string;
   protectedPrivateKey: ProtectedPrivateKeyBundle;
+  /** RSA-OAEP-2048 public key exported as JWK – safe to store on the server */
+  publicKeyJwk: JsonWebKey;
 }
 
 /**
@@ -269,11 +271,15 @@ export async function generateUserKeyBundle(
     passphrase
   );
 
+  // Export public key as JWK so the server can store it for peer key-wrapping
+  const publicKeyJwk = await webCrypto.subtle.exportKey('jwk', keyPair.publicKey);
+
   return {
     publicKey: keyPair.publicKey,
     privateKey: unlockedPrivateKey,
     keyFingerprint,
     protectedPrivateKey,
+    publicKeyJwk,
   };
 }
 
@@ -306,6 +312,21 @@ export async function unlockPrivateKeyWithPassphrase(
  * Generates real RSA-OAEP-2048 public keys for mock campus recipients so every
  * recipient selection performs authentic Web Crypto RSA-OAEP-2048 key wrapping.
  */
+/**
+ * Imports an RSA-OAEP-2048 public key from a JWK object (retrieved from server).
+ * Used to hydrate the campus directory with real per-user public keys.
+ */
+export async function importPublicKeyFromJwk(jwk: JsonWebKey): Promise<CryptoKey> {
+  const webCrypto = getWebCrypto();
+  return webCrypto.subtle.importKey(
+    'jwk',
+    jwk,
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    true,
+    ['encrypt', 'wrapKey']
+  );
+}
+
 export async function hydrateRecipientsWithRealKeys(
   recipients: Recipient[]
 ): Promise<Recipient[]> {

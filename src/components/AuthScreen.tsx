@@ -4,8 +4,16 @@ import type { UserProfile, UserRole } from '../types/vault';
 import {
   evaluatePassphraseStrength,
   generateUserKeyBundle,
+  importPublicKeyFromJwk,
+  unlockPrivateKeyWithPassphrase,
   validateAuthForm,
 } from '../utils/cryptoEngine';
+import {
+  login,
+  logout,
+  pushKeyMaterial,
+  register,
+} from '../utils/apiClient';
 
 interface AuthScreenProps {
   onAuthenticated: (user: UserProfile) => void;
@@ -72,52 +80,107 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
     setIsDerivingKeys(true);
     try {
       const normalizedEmail = email.trim().toLowerCase();
-      const keyMaterial = await generateUserKeyBundle(passphrase);
 
-      const emailNameFallback = normalizedEmail
-        .split('@')[0]
-        .split(/[._-]+/)
-        .filter(Boolean)
-        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-        .join(' ');
+      let resolvedId: string;
+      let resolvedName2: string;
+      let resolvedDept: string;
+      let resolvedRole: UserRole;
+      let finalPublicKey: CryptoKey;
+      let finalPrivateKey: CryptoKey;
+      let finalFingerprint: string;
+      let finalProtectedPrivateKey: import('../types/vault').ProtectedPrivateKeyBundle;
 
-      const resolvedName = name.trim() || emailNameFallback || 'Campus Member';
-      const department =
-        role === 'Faculty' ? 'Applied Cryptography' : 'Computer Science (M.S.)';
+      if (mode === 'register') {
+        // ── REGISTER ────────────────────────────────────────────────────────────
+        // Generate a fresh RSA-OAEP-2048 key pair + PBKDF2-AES-GCM-wrapped
+        // private key entirely in the browser. Passphrase NEVER leaves device.
+        const resolvedName = name.trim() || normalizedEmail.split('@')[0] || 'Campus Member';
+        const department =
+          role === 'Faculty' ? 'Applied Cryptography' : 'Computer Science (M.S.)';
 
-      const knownIds: Record<string, string> = {
-        'e.vance@jbitdoon.edu.in': 'usr-vance',
-        'm.thorne@jbitdoon.edu.in': 'usr-thorne',
-        'p.nair@jbitdoon.edu.in': 'usr-nair',
-        'm.lin@jbitdoon.edu.in': 'usr-lin',
-        'j.alvarez@jbitdoon.edu.in': 'usr-alvarez',
-        's.okafor@jbitdoon.edu.in': 'usr-okafor',
-      };
+        const keyMaterial = await generateUserKeyBundle(passphrase);
 
-      const resolvedId =
-        knownIds[normalizedEmail] ??
-        `usr-${normalizedEmail.replace(/[^a-z0-9]/g, '').slice(0, 10)}`;
+        const res = await register({
+          name: resolvedName,
+          email: normalizedEmail,
+          password,
+          role,
+          department,
+          publicKeyJwk: keyMaterial.publicKeyJwk,
+          keyFingerprint: keyMaterial.keyFingerprint,
+          protectedPrivateKey: keyMaterial.protectedPrivateKey,
+        });
+
+        resolvedId = res.user.id;
+        resolvedName2 = res.user.name;
+        resolvedDept = res.user.department;
+        resolvedRole = res.user.role;
+        finalPublicKey = keyMaterial.publicKey;
+        finalPrivateKey = keyMaterial.privateKey;
+        finalFingerprint = keyMaterial.keyFingerprint;
+        finalProtectedPrivateKey = keyMaterial.protectedPrivateKey;
+      } else {
+        // ── LOGIN ────────────────────────────────────────────────────────────────
+        // Authenticate with the server and get back the OPAQUE private-key bundle.
+        // We then use the Vault Passphrase (which never leaves the browser) to
+        // PBKDF2-unwrap the private key locally. If the server has no stored key
+        // material yet (first login after migration), we generate a new pair and
+        // push it.
+        const res = await login({ email: normalizedEmail, password });
+        resolvedId = res.user.id;
+        resolvedName2 = res.user.name;
+        resolvedDept = res.user.department;
+        resolvedRole = res.user.role;
+
+        if (res.protectedPrivateKey && res.publicKeyJwk) {
+          // ✅ Normal path: unwrap the SAME private key that was used to encrypt
+          //    wrapped AES keys during previous uploads.
+          const bundle = res.protectedPrivateKey as import('../types/vault').ProtectedPrivateKeyBundle;
+          finalPrivateKey = await unlockPrivateKeyWithPassphrase(bundle, passphrase);
+          finalPublicKey = await importPublicKeyFromJwk(res.publicKeyJwk);
+          finalProtectedPrivateKey = bundle;
+          // Recompute fingerprint from the stored public key JWK
+          const { computePublicKeyFingerprint } = await import('../utils/cryptoEngine');
+          finalFingerprint = await computePublicKeyFingerprint(finalPublicKey);
+        } else {
+          // ⚠️ First login after migration – no key material on server yet.
+          // Generate a new pair, push it. The user will need to re-upload files
+          // (or we could skip file display for un-keyed files).
+          const keyMaterial = await generateUserKeyBundle(passphrase);
+          await pushKeyMaterial({
+            publicKeyJwk: keyMaterial.publicKeyJwk,
+            keyFingerprint: keyMaterial.keyFingerprint,
+            protectedPrivateKey: keyMaterial.protectedPrivateKey,
+          }).catch(() => { /* non-critical */ });
+          finalPublicKey = keyMaterial.publicKey;
+          finalPrivateKey = keyMaterial.privateKey;
+          finalFingerprint = keyMaterial.keyFingerprint;
+          finalProtectedPrivateKey = keyMaterial.protectedPrivateKey;
+        }
+      }
 
       onAuthenticated({
         id: resolvedId,
-        name: resolvedName,
+        name: resolvedName2,
         email: normalizedEmail,
-        role,
-        department,
-        keyFingerprint: keyMaterial.keyFingerprint,
-        publicKey: keyMaterial.publicKey,
-        privateKey: keyMaterial.privateKey,
-        protectedPrivateKey: keyMaterial.protectedPrivateKey,
+        role: resolvedRole,
+        department: resolvedDept,
+        keyFingerprint: finalFingerprint,
+        publicKey: finalPublicKey,
+        privateKey: finalPrivateKey,
+        protectedPrivateKey: finalProtectedPrivateKey,
         vaultUnlockedAt: new Date().toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit',
         }),
       });
     } catch (err) {
+      // Clear any stored token so a retry starts fresh
+      logout();
       setCryptoError(
         err instanceof Error
           ? err.message
-          : 'Failed to generate RSA-OAEP-2048 key pair in Web Crypto API.'
+          : 'Authentication failed. Check your credentials and Vault Passphrase.'
       );
     } finally {
       setIsDerivingKeys(false);
@@ -468,15 +531,17 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
               {isDerivingKeys ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  <span>Generating RSA-OAEP-2048 Key Pair…</span>
+                  <span>
+                    {mode === 'login' ? 'Authenticating & Unlocking Key…' : 'Generating RSA-OAEP-2048 Key Pair…'}
+                  </span>
                 </>
               ) : (
                 <>
                   <Lock className="h-4 w-4" aria-hidden="true" />
                   <span>
                     {mode === 'login'
-                      ? 'Unlock Private Key & Enter Vault'
-                      : 'Generate Key & Enter Vault'}
+                      ? 'Sign In & Unlock Private Key'
+                      : 'Register & Generate Key Pair'}
                   </span>
                 </>
               )}

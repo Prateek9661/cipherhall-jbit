@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { FileUp, Loader2, Lock, ShieldCheck, X } from 'lucide-react';
 import type { Recipient, UserProfile, VaultFile } from '../types/vault';
 import { encryptPayloadWithWebCrypto } from '../utils/cryptoEngine';
+import { uploadEncryptedFile } from '../utils/apiClient';
 
 interface UploadEncryptModalProps {
   open: boolean;
@@ -170,7 +171,32 @@ export function UploadEncryptModal({
         crypto: envelope,
       };
 
-      onFileEncrypted(newFile);
+      // ── Upload encrypted blob to server (best-effort) ──────────────────────
+      // The raw ciphertext blob (AES-256-GCM) is sent. The server NEVER
+      // decrypts it. If upload fails, the file is still available locally.
+      try {
+        const serverFile = await uploadEncryptedFile(
+          selectedFileBytes && selectedFileBytes.byteLength > 0 ? selectedFileBytes : null,
+          {
+            filename: cleanedFilename,
+            fileType: extension,
+            mimeType: resolvedMime,
+            sizeBytes: plaintextBytes.byteLength,
+            department: currentUser.department,
+            recipients: chosenRecipients.map((r) => r.name),
+            authorizedUserIds: chosenRecipients
+              .map((r) => r.id)
+              .filter((id) => id && !id.startsWith('usr-')), // only real server IDs
+            cryptoEnvelope: envelope,
+          }
+        );
+        // Use server-assigned ID so future fetches match
+        onFileEncrypted({ ...newFile, id: serverFile.id });
+      } catch {
+        // Server upload failed (offline / not running) – use local-only file
+        onFileEncrypted(newFile);
+      }
+
       setFilename('');
       setSelectedFileBytes(null);
       setSelectedFileMime(undefined);
