@@ -3,6 +3,8 @@
 **End-to-End Client-Side Cryptographic Platform for Academic Institutions**  
 Built for **JB Institute of Technology, Dehradun** (`@jbitdoon.edu.in`)
 
+**Live Platform:** https://cipherhall-jbit.pages.dev
+
 > *"Your files and messages are encrypted on your device before leaving your browser. Not even campus IT admins can read them."*
 
 ---
