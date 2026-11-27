@@ -131,7 +131,18 @@ export function ActivityLog({ events }: ActivityLogProps) {
 
       {/* Clean Audit Feed */}
       <div className="rounded-xl border border-slate-800/90 bg-[#111824] overflow-hidden">
-        {filteredEvents.length === 0 ? (
+        {events.length === 0 ? (
+          <div className="py-16 px-6 text-center">
+            <History className="h-9 w-9 text-slate-600 mx-auto" aria-hidden="true" />
+            <h2 className="mt-3 font-display text-base font-medium text-slate-200">
+              No activity recorded yet
+            </h2>
+            <p className="mt-1 text-sm text-slate-400 max-w-md mx-auto">
+              Encrypted file uploads, local decryptions, access changes, and key backups will
+              appear here automatically.
+            </p>
+          </div>
+        ) : filteredEvents.length === 0 ? (
           <div className="py-16 px-6 text-center">
             <History className="h-9 w-9 text-slate-600 mx-auto" aria-hidden="true" />
             <h2 className="mt-3 font-display text-base font-medium text-slate-200">

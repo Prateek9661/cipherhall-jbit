@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import { ActivityLog } from './components/ActivityLog';
 import { AuthScreen } from './components/AuthScreen';
@@ -11,19 +11,24 @@ import { SidebarNav } from './components/SidebarNav';
 import { TopHeader } from './components/TopHeader';
 import { UploadEncryptModal } from './components/UploadEncryptModal';
 import {
-  CAMPUS_RECIPIENTS,
-  DEFAULT_DEMO_USER,
-  INITIAL_ACTIVITY_LOG,
-  INITIAL_CHAT_THREADS,
-  INITIAL_VAULT_FILES,
-} from './data/mockVaultData';
+  fetchActivityLogApi,
+  fetchEncryptedMessagesApi,
+  fetchRegisteredUsersApi,
+  fetchVaultFilesApi,
+  recordActivityEventApi,
+  sendEncryptedMessageApi,
+  updateFileAccessApi,
+  uploadEncryptedFileApi,
+} from './services/vaultApi';
 import type {
   ActivityCategory,
   ActivityEvent,
   ChatMessage,
   ChatThread,
+  CryptoEnvelope,
   InspectorTarget,
   Recipient,
+  StoredEncryptedMessageDTO,
   UserProfile,
   VaultFile,
   WorkspaceView,
@@ -31,54 +36,59 @@ import type {
 import {
   decryptPayloadWithWebCrypto,
   encryptPayloadWithWebCrypto,
-  generateUserKeyBundle,
-  hydrateRecipientsWithRealKeys,
-  importPublicKeyFromJwk,
-  updateFileRecipientAccess,
-  verifyFileIntegrity,
+  rewrapAesKeyForRecipients,
 } from './utils/cryptoEngine';
-import {
-  checkHealth,
-  fetchCampusDirectory,
-  fetchVaultFiles,
-  logout,
-  pushKeyMaterial,
-  sendEncryptedMessage,
-  updateFileAccess,
-  type ApiVaultFile,
-} from './utils/apiClient';
 
-function shouldAutostartWorkspace(): boolean {
-  if (typeof window === 'undefined') return false;
-  const params = new URLSearchParams(window.location.search);
-  return params.get('autostart') === '1';
-}
+async function decryptStoredMessages(
+  stored: StoredEncryptedMessageDTO[],
+  currentUser: UserProfile
+): Promise<ChatMessage[]> {
+  const decoder = new TextDecoder();
+  return Promise.all(
+    stored.map(async (msg) => {
+      const peerId = msg.senderId === currentUser.id ? msg.recipientId : msg.senderId;
+      let plaintext = 'Encrypted message (unlock key required)';
+      if (currentUser.privateKey) {
+        try {
+          const result = await decryptPayloadWithWebCrypto({
+            envelope: msg.crypto,
+            privateKey: currentUser.privateKey,
+            recipientId: currentUser.id,
+            recipientFingerprint: currentUser.keyFingerprint,
+          });
+          plaintext = decoder.decode(result.plaintextBytes);
+        } catch {
+          plaintext = 'Unable to decrypt message with your current private key.';
+        }
+      }
 
-function formatNowTimeLabel(): string {
-  const now = new Date();
-  const time = now.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-  return `Today · ${time}`;
+      return {
+        id: msg.id,
+        threadId: peerId,
+        senderId: msg.senderId,
+        senderName: msg.senderName,
+        senderRole: msg.senderRole,
+        text: plaintext,
+        timestamp: msg.timestamp,
+        isCurrentUser: msg.senderId === currentUser.id,
+        attachedFile: msg.attachedFile,
+        crypto: msg.crypto,
+      };
+    })
+  );
 }
 
 export default function App() {
-  const [user, setUser] = useState<UserProfile | null>(() =>
-    shouldAutostartWorkspace() ? DEFAULT_DEMO_USER : null
-  );
-  const [recipients, setRecipients] = useState<Recipient[]>(CAMPUS_RECIPIENTS);
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [registeredUsers, setRegisteredUsers] = useState<Recipient[]>([]);
   const [activeView, setActiveView] = useState<WorkspaceView>('vault');
-  const [files, setFiles] = useState<VaultFile[]>(INITIAL_VAULT_FILES);
-  const [threads, setThreads] = useState<ChatThread[]>(INITIAL_CHAT_THREADS);
-  const [activeThreadId, setActiveThreadId] = useState<string>(INITIAL_CHAT_THREADS[0].id);
-  const [activityLog, setActivityLog] = useState<ActivityEvent[]>(INITIAL_ACTIVITY_LOG);
+  const [files, setFiles] = useState<VaultFile[]>([]);
+  const [decryptedMessages, setDecryptedMessages] = useState<ChatMessage[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [activityLog, setActivityLog] = useState<ActivityEvent[]>([]);
   const [inspectorOpen, setInspectorOpen] = useState<boolean>(false);
-  const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget | null>({
-    kind: 'file',
-    file: INITIAL_VAULT_FILES[0],
-  });
+  const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget | null>(null);
   const [uploadModalOpen, setUploadModalOpen] = useState<boolean>(false);
   const [securityModalOpen, setSecurityModalOpen] = useState<boolean>(false);
   const [manageAccessFile, setManageAccessFile] = useState<VaultFile | null>(null);
@@ -88,209 +98,135 @@ export default function App() {
   } | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState<boolean>(false);
 
-  const appendActivity = (params: {
+  const syncWorkspaceData = useCallback(
+    async (token: string, currentUser: UserProfile) => {
+      try {
+        const [usersList, filesList, rawMessages, eventsList] = await Promise.all([
+          fetchRegisteredUsersApi(token),
+          fetchVaultFilesApi(token),
+          fetchEncryptedMessagesApi(token),
+          fetchActivityLogApi(token),
+        ]);
+
+        setRegisteredUsers(usersList);
+        setFiles(filesList);
+        setActivityLog(eventsList);
+
+        const messages = await decryptStoredMessages(rawMessages, currentUser);
+        setDecryptedMessages(messages);
+
+        setInspectorTarget((prev) => {
+          if (prev) return prev;
+          if (filesList.length > 0) return { kind: 'file', file: filesList[0] };
+          return null;
+        });
+      } catch (err) {
+        setVaultNotice({
+          state: 'error',
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Unable to load encrypted workspace data from the server.',
+        });
+      }
+    },
+    []
+  );
+
+  // Refresh workspace data when user switches views or opens recipient modals
+  useEffect(() => {
+    if (!authToken || !user) return;
+    void syncWorkspaceData(authToken, user);
+  }, [authToken, user, activeView, uploadModalOpen, manageAccessFile, syncWorkspaceData]);
+
+  // Build 1-on-1 chat threads strictly from real registered users (excluding current user)
+  const chatThreads = useMemo<ChatThread[]>(() => {
+    if (!user) return [];
+    const peers = registeredUsers.filter((u) => u.id !== user.id);
+
+    const messagesByPeer = new Map<string, ChatMessage[]>();
+    for (const msg of decryptedMessages) {
+      const list = messagesByPeer.get(msg.threadId) ?? [];
+      list.push(msg);
+      messagesByPeer.set(msg.threadId, list);
+    }
+
+    return peers.map((peer) => {
+      const peerMessages = messagesByPeer.get(peer.id) ?? [];
+      const latest = peerMessages[peerMessages.length - 1];
+      return {
+        id: peer.id,
+        title: peer.name,
+        type: 'direct',
+        subtitle: `${peer.role} · ${peer.department}`,
+        participantEmail: peer.email,
+        participantRole: peer.role,
+        memberCount: 2,
+        recipientIds: [user.id, peer.id],
+        unreadCount: 0,
+        lastActivity: latest?.timestamp ?? '',
+        messages: peerMessages,
+      };
+    });
+  }, [registeredUsers, decryptedMessages, user]);
+
+  useEffect(() => {
+    if (chatThreads.length === 0) {
+      setActiveThreadId(null);
+      return;
+    }
+    setActiveThreadId((prev) =>
+      prev && chatThreads.some((t) => t.id === prev) ? prev : chatThreads[0].id
+    );
+  }, [chatThreads]);
+
+  const activeThread = useMemo(
+    () =>
+      (activeThreadId ? chatThreads.find((t) => t.id === activeThreadId) : undefined) ??
+      chatThreads[0] ??
+      null,
+    [chatThreads, activeThreadId]
+  );
+
+  const recordClientActivity = async (params: {
     category: ActivityCategory;
     title: string;
     detail: string;
-    actor?: UserProfile | null;
     status?: 'info' | 'success' | 'warning';
     statusLabel?: string;
   }) => {
-    const actor = params.actor ?? user;
-    const entry: ActivityEvent = {
-      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      category: params.category,
-      title: params.title,
-      detail: params.detail,
-      actorName: actor?.name ?? 'Campus Member',
-      actorRole: actor?.role ?? 'Student',
-      timestampLabel: formatNowTimeLabel(),
-      status: params.status ?? 'info',
-      statusLabel: params.statusLabel,
-    };
-    setActivityLog((prev) => [entry, ...prev]);
+    if (!authToken) return;
+    try {
+      const event = await recordActivityEventApi(authToken, params);
+      setActivityLog((prev) => [event, ...prev]);
+    } catch {
+      // Non-blocking audit log recording
+    }
   };
 
-  // Hydrate campus directory with real RSA-OAEP-2048 public keys for authentic Web Crypto key wrapping
-  useEffect(() => {
-    let cancelled = false;
-    hydrateRecipientsWithRealKeys(CAMPUS_RECIPIENTS)
-      .then((hydrated) => {
-        if (!cancelled) {
-          setRecipients(hydrated);
-        }
-      })
-      .catch(() => {
-        // Fallback handled lazily during encryption if Web Crypto is deferred
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // ── API: fetch real campus directory (overwrites mock when server is reachable) ──
-  useEffect(() => {
-    if (!user) return;
-    let cancelled = false;
-    import('./utils/apiClient').then(({ fetchCampusDirectory }) =>
-      fetchCampusDirectory()
-    ).then(async (apiRecipients) => {
-      if (cancelled) return;
-      const { importPublicKeyFromJwk } = await import('./utils/cryptoEngine');
-      const hydrated: Recipient[] = await Promise.all(
-        apiRecipients.map(async (r) => {
-          let pubKey: CryptoKey | undefined;
-          if (r.publicKeyJwk) {
-            try { pubKey = await importPublicKeyFromJwk(r.publicKeyJwk); } catch { /* skip */ }
-          }
-          return {
-            id: r.id,
-            name: r.name,
-            email: r.email,
-            role: r.role,
-            department: r.department,
-            keyFingerprint: r.keyFingerprint,
-            publicKey: pubKey,
-          };
-        })
-      );
-      if (!cancelled) setRecipients(hydrated);
-    }).catch(() => { /* server not reachable – keep local mock directory */ });
-    return () => { cancelled = true; };
-  }, [user?.id]);
-
-  // ── API: load vault files from server on login ────────────────────────────────
-  useEffect(() => {
-    if (!user) return;
-    let cancelled = false;
-    import('./utils/apiClient').then(({ fetchVaultFiles }) =>
-      fetchVaultFiles()
-    ).then((apiFiles) => {
-      if (cancelled) return;
-      const mapped: VaultFile[] = apiFiles.map((f) => ({
-        id: f.id,
-        filename: f.filename,
-        fileType: f.fileType,
-        mimeType: f.mimeType,
-        sizeBytes: f.sizeBytes,
-        uploadedBy: f.uploadedBy,
-        uploadedByRole: f.uploadedByRole,
-        department: f.department,
-        uploadedAt: f.uploadedAt,
-        dateLabel: new Date(f.uploadedAt).toLocaleDateString('en-IN', {
-          day: 'numeric', month: 'short', year: 'numeric',
-        }),
-        sha256Status: f.sha256Status,
-        decryptedPreviewContent: '',
-        recipients: f.recipients,
-        crypto: f.crypto as VaultFile['crypto'],
-      }));
-      const serverIds = new Set(mapped.map((f) => f.id));
-      const localOnly = INITIAL_VAULT_FILES.filter((f) => !serverIds.has(f.id));
-      if (!cancelled) setFiles([...mapped, ...localOnly]);
-    }).catch(() => { /* server not reachable – keep local demo files */ });
-    return () => { cancelled = true; };
-  }, [user?.id]);
-
-  // When autostart=1 is used, generate a real RSA-OAEP-2048 key pair & PBKDF2-protected private key for the demo session
-  useEffect(() => {
-    if (!user || user.privateKey) return;
-    let cancelled = false;
-    generateUserKeyBundle('cedar-lattice-410')
-      .then((material) => {
-        if (!cancelled) {
-          setUser((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  keyFingerprint: material.keyFingerprint,
-                  publicKey: material.publicKey,
-                  privateKey: material.privateKey,
-                  protectedPrivateKey: material.protectedPrivateKey,
-                }
-              : prev
-          );
-        }
-      })
-      .catch(() => {
-        // Ignore if unmounted
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [user]);
-
-  const syncedRecipients = useMemo<Recipient[]>(() => {
-    if (!user) return recipients;
-    return recipients.map((r) =>
-      r.id === user.id || r.email.toLowerCase() === user.email.toLowerCase()
-        ? {
-            ...r,
-            id: user.id,
-            name: user.name,
-            role: user.role,
-            keyFingerprint: user.keyFingerprint,
-            publicKey: user.publicKey ?? r.publicKey,
-          }
-        : r
-    );
-  }, [recipients, user]);
-
-  const displayThreads = useMemo<ChatThread[]>(() => {
-    if (!user) return threads;
-    return threads.map((thread) => {
-      const normalizedMessages = thread.messages.map((msg) => ({
-        ...msg,
-        isCurrentUser: msg.senderId === user.id,
-      }));
-      // If signed in as Dr. Elena Vance, display Maya Lin as the 1-on-1 counterparty on thread-vance
-      if (thread.id === 'thread-vance' && user.id === 'usr-vance') {
-        return {
-          ...thread,
-          title: 'Maya Lin',
-          subtitle: 'Student · Computer Science (M.S.)',
-          participantRole: 'Student',
-          messages: normalizedMessages,
-        };
-      }
-      return {
-        ...thread,
-        messages: normalizedMessages,
-      };
-    });
-  }, [threads, user]);
-
-  const unreadChatCount = useMemo(
-    () => displayThreads.reduce((total, thread) => total + thread.unreadCount, 0),
-    [displayThreads]
-  );
-
-  const activeThread = useMemo(
-    () => displayThreads.find((t) => t.id === activeThreadId) ?? displayThreads[0],
-    [displayThreads, activeThreadId]
-  );
-
-  const handleAuthenticated = (authenticatedUser: UserProfile) => {
-    setUser(authenticatedUser);
+  const handleAuthenticated = (session: { user: UserProfile; token: string }) => {
+    setUser(session.user);
+    setAuthToken(session.token);
     setActiveView('vault');
-    setInspectorTarget({ kind: 'file', file: files[0] });
+    setFiles([]);
+    setDecryptedMessages([]);
+    setRegisteredUsers([]);
+    setActivityLog([]);
+    setActiveThreadId(null);
+    setInspectorTarget(null);
     setInspectorOpen(false);
     setVaultNotice(null);
-    appendActivity({
-      category: 'security',
-      title: `${authenticatedUser.name} unlocked local vault session`,
-      detail: 'Personal RSA-2048 private key unlocked locally on this device.',
-      actor: authenticatedUser,
-      status: 'success',
-      statusLabel: 'Protected',
-    });
   };
 
   const handleSignOut = () => {
-    // Clear JWT from sessionStorage so the next session starts fresh
-    import('./utils/apiClient').then(({ logout }) => logout()).catch(() => {});
     setUser(null);
-    setFiles(INITIAL_VAULT_FILES);
+    setAuthToken(null);
+    setRegisteredUsers([]);
+    setFiles([]);
+    setDecryptedMessages([]);
+    setActivityLog([]);
+    setActiveThreadId(null);
+    setInspectorTarget(null);
     setUploadModalOpen(false);
     setSecurityModalOpen(false);
     setManageAccessFile(null);
@@ -303,76 +239,88 @@ export default function App() {
     setInspectorTarget({ kind: 'file', file });
   };
 
-  const handleFileEncrypted = (newFile: VaultFile) => {
-    setFiles((prev) => [newFile, ...prev]);
-    setInspectorTarget({ kind: 'file', file: newFile });
-    const count = newFile.recipients.length;
-    appendActivity({
-      category: 'file',
-      title: `${newFile.uploadedBy} encrypted & uploaded ${newFile.filename}`,
-      detail: `Encrypted locally on your device and shared with ${count} ${
-        count === 1 ? 'person' : 'people'
+  const handleUploadEncryptedFile = async (payload: {
+    filename: string;
+    mimeType?: string;
+    sizeBytes: number;
+    recipientIds: string[];
+    crypto: CryptoEnvelope;
+  }) => {
+    if (!authToken || !user) {
+      throw new Error('Your session has expired. Please sign in again.');
+    }
+    const storedFile = await uploadEncryptedFileApi(authToken, payload);
+    setFiles((prev) => [storedFile, ...prev]);
+    setInspectorTarget({ kind: 'file', file: storedFile });
+    setVaultNotice({
+      state: 'success',
+      message: `Encrypted & uploaded ${storedFile.filename} for ${storedFile.recipients.length} ${
+        storedFile.recipients.length === 1 ? 'person' : 'people'
       }.`,
-      status: 'success',
-      statusLabel: 'Verified',
     });
+    const events = await fetchActivityLogApi(authToken).catch(() => null);
+    if (events) setActivityLog(events);
   };
 
-  const handleSaveFileAccess = (file: VaultFile, retainedNames: string[]) => {
-    const { updatedFile, revokedNames, addedNames } = updateFileRecipientAccess(
-      file,
-      retainedNames
-    );
-
-    setFiles((prev) => prev.map((f) => (f.id === file.id ? updatedFile : f)));
-    if (inspectorTarget?.kind === 'file' && inspectorTarget.file.id === file.id) {
-      setInspectorTarget({ kind: 'file', file: updatedFile });
+  const handleSaveFileAccess = async (
+    file: VaultFile,
+    retainedRecipientIds: string[]
+  ) => {
+    if (!authToken || !user || !user.privateKey) {
+      throw new Error('Unable to update file keys without an active unlocked private key.');
     }
 
-    // ── Persist access change to server (best-effort, non-blocking) ──
-    import('./utils/apiClient').then(({ updateFileAccess }) =>
-      updateFileAccess(file.id, {
-        recipients: updatedFile.recipients,
-        authorizedUserIds: [], // server resolves by name for now; can pass IDs later
-        cryptoEnvelope: updatedFile.crypto,
-      })
-    ).catch(() => { /* non-critical: local state already updated */ });
+    const targetRecipients = registeredUsers
+      .filter((r) => retainedRecipientIds.includes(r.id))
+      .map((r) =>
+        r.id === user.id
+          ? {
+              ...r,
+              publicKey: user.publicKey ?? r.publicKey,
+              publicKeySpkiBase64: user.publicKeySpkiBase64 ?? r.publicKeySpkiBase64,
+            }
+          : r
+      );
+
+    const rewrappedKeys = await rewrapAesKeyForRecipients({
+      envelope: file.crypto,
+      ownerPrivateKey: user.privateKey,
+      ownerRecipientId: user.id,
+      ownerFingerprint: user.keyFingerprint,
+      targetRecipients,
+    });
+
+    const result = await updateFileAccessApi(authToken, file.id, {
+      recipientIds: retainedRecipientIds,
+      wrappedKeys: rewrappedKeys,
+    });
+
+    setFiles((prev) => prev.map((f) => (f.id === file.id ? result.file : f)));
+    if (inspectorTarget?.kind === 'file' && inspectorTarget.file.id === file.id) {
+      setInspectorTarget({ kind: 'file', file: result.file });
+    }
 
     const parts: string[] = [];
-    if (revokedNames.length > 0) {
-      parts.push(`Revoked access for ${revokedNames.join(', ')}`);
+    if (result.revokedNames.length > 0) {
+      parts.push(`Revoked access for ${result.revokedNames.join(', ')}`);
     }
-    if (addedNames.length > 0) {
-      parts.push(`Granted access to ${addedNames.join(', ')}`);
+    if (result.addedNames.length > 0) {
+      parts.push(`Granted access to ${result.addedNames.join(', ')}`);
     }
-    const summary = parts.join(' and ');
+    const summary = parts.join(' and ') || 'Updated file access';
 
     setVaultNotice({
       state: 'success',
       message: `${summary} on ${file.filename}.`,
     });
 
-    const actorName = user?.name ?? 'Faculty';
-    appendActivity({
-      category: 'access',
-      title:
-        revokedNames.length > 0
-          ? `${actorName} revoked access on ${file.filename}`
-          : `${actorName} updated access on ${file.filename}`,
-      detail: `${summary}. ${updatedFile.recipients.length} ${
-        updatedFile.recipients.length === 1 ? 'person' : 'people'
-      } currently authorized.`,
-      status: revokedNames.length > 0 ? 'warning' : 'info',
-      statusLabel: revokedNames.length > 0 ? 'Access Revoked' : 'Access Updated',
-    });
+    const events = await fetchActivityLogApi(authToken).catch(() => null);
+    if (events) setActivityLog(events);
   };
 
   const handleSelectThread = (threadId: string) => {
     setActiveThreadId(threadId);
-    setThreads((prev) =>
-      prev.map((t) => (t.id === threadId ? { ...t, unreadCount: 0 } : t))
-    );
-    const chosen = displayThreads.find((t) => t.id === threadId);
+    const chosen = chatThreads.find((t) => t.id === threadId);
     if (chosen && chosen.messages.length > 0) {
       const latestMsg = chosen.messages[chosen.messages.length - 1];
       setInspectorTarget({
@@ -392,54 +340,33 @@ export default function App() {
     text: string,
     attachedFile?: VaultFile
   ) => {
-    if (!user) return;
-    const thread = displayThreads.find((t) => t.id === threadId);
-    if (!thread) return;
-
-    const now = new Date();
-    const timestamp = now.toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
-
-    const threadRecipients = syncedRecipients.filter((r) =>
-      thread.recipientIds.includes(r.id)
-    );
-    const effectiveThreadRecipients: Recipient[] =
-      threadRecipients.length > 0 ? [...threadRecipients] : syncedRecipients.slice(0, 2);
-
-    if (!effectiveThreadRecipients.some((r) => r.id === user.id)) {
-      effectiveThreadRecipients.unshift({
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        department: user.department,
-        keyFingerprint: user.keyFingerprint,
-        publicKey: user.publicKey,
-      });
+    if (!user || !authToken) return;
+    const peer = registeredUsers.find((u) => u.id === threadId);
+    if (!peer) {
+      throw new Error('Selected contact is no longer available.');
     }
 
-    const payloadString = attachedFile
-      ? `${text}\n[Attachment: ${attachedFile.filename}]`
-      : text;
-    const messageBytes = new TextEncoder().encode(payloadString);
+    const selfRecipient: Recipient = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      department: user.department,
+      keyFingerprint: user.keyFingerprint,
+      publicKeySpkiBase64: user.publicKeySpkiBase64,
+      publicKey: user.publicKey,
+    };
+
+    const now = new Date();
+    const messageBytes = new TextEncoder().encode(text);
     const envelope = await encryptPayloadWithWebCrypto({
       plaintextBytes: messageBytes,
-      recipients: effectiveThreadRecipients,
+      recipients: [selfRecipient, peer],
       encryptedAt: `${now.toISOString().replace('T', ' ').slice(0, 19)} UTC`,
     });
 
-    const newMessage: ChatMessage = {
-      id: `msg-${now.getTime()}`,
-      threadId,
-      senderId: user.id,
-      senderName: user.name,
-      senderRole: user.role,
-      text,
-      timestamp,
-      isCurrentUser: true,
+    const storedMsg = await sendEncryptedMessageApi(authToken, {
+      recipientId: peer.id,
       attachedFile: attachedFile
         ? {
             fileId: attachedFile.id,
@@ -449,57 +376,43 @@ export default function App() {
           }
         : undefined,
       crypto: envelope,
+    });
+
+    const newMessage: ChatMessage = {
+      id: storedMsg.id,
+      threadId: peer.id,
+      senderId: storedMsg.senderId,
+      senderName: storedMsg.senderName,
+      senderRole: storedMsg.senderRole,
+      text,
+      timestamp: storedMsg.timestamp,
+      isCurrentUser: true,
+      attachedFile: storedMsg.attachedFile,
+      crypto: storedMsg.crypto,
     };
 
-    setThreads((prev) =>
-      prev.map((t) =>
-        t.id === threadId
-          ? {
-              ...t,
-              lastActivity: timestamp,
-              messages: [...t.messages, newMessage],
-            }
-          : t
-      )
-    );
+    setDecryptedMessages((prev) => [...prev, newMessage]);
     setInspectorTarget({
       kind: 'message',
       message: newMessage,
-      threadTitle: thread.title,
+      threadTitle: peer.name,
     });
 
-    appendActivity({
-      category: 'chat',
-      title: attachedFile
-        ? `${user.name} shared ${attachedFile.filename} with ${thread.title}`
-        : `${user.name} sent an encrypted message to ${thread.title}`,
-      detail: attachedFile
-        ? 'Attached an encrypted vault document inside an end-to-end encrypted conversation.'
-        : `Encrypted message delivered locally for ${effectiveThreadRecipients.length} participants.`,
-      status: 'info',
-      statusLabel: 'Encrypted',
-    });
-
-    // ── Persist encrypted message to server (best-effort) ──
-    // The peer recipient is the first non-self participant.
-    const peerRecipient = effectiveThreadRecipients.find((r) => r.id !== user.id);
-    if (peerRecipient) {
-      import('./utils/apiClient').then(({ sendEncryptedMessage }) =>
-        sendEncryptedMessage({
-          recipientId: peerRecipient.id,
-          cryptoEnvelope: envelope,
-          attachedFileId: attachedFile?.id ?? null,
-        })
-      ).catch(() => { /* non-critical: local state already updated */ });
-    }
+    const events = await fetchActivityLogApi(authToken).catch(() => null);
+    if (events) setActivityLog(events);
   };
 
   const handleDownloadVaultFileFromChat = async (
     fileId: string
   ): Promise<{ state: 'success' | 'error'; message: string } | void> => {
-    if (!user) return;
+    if (!user || !user.privateKey) return;
     const targetFile = files.find((f) => f.id === fileId);
-    if (!targetFile) return;
+    if (!targetFile) {
+      return {
+        state: 'error',
+        message: 'This file is not currently shared with your account.',
+      };
+    }
 
     const triggerDownload = (blob: Blob, downloadName: string) => {
       const url = URL.createObjectURL(blob);
@@ -512,87 +425,46 @@ export default function App() {
       URL.revokeObjectURL(url);
     };
 
-    if (
-      targetFile.crypto.isWebCryptoReal &&
-      targetFile.crypto.rawCiphertextBase64 &&
-      user.privateKey
-    ) {
-      try {
-        const result = await decryptPayloadWithWebCrypto({
-          envelope: targetFile.crypto,
-          privateKey: user.privateKey,
-          recipientId: user.id,
-          recipientFingerprint: user.keyFingerprint,
-        });
-        const copy = new Uint8Array(result.plaintextBytes.byteLength);
-        copy.set(result.plaintextBytes);
-        triggerDownload(
-          new Blob([copy.buffer], {
-            type: targetFile.mimeType || 'application/octet-stream',
-          }),
-          targetFile.filename
-        );
-        appendActivity({
-          category: 'file',
-          title: `${user.name} decrypted ${targetFile.filename} from chat`,
-          detail: 'Verified integrity locally and decrypted shared attachment.',
-          status: 'success',
-          statusLabel: 'Verified',
-        });
-        return {
-          state: 'success',
-          message: `Decrypted ${targetFile.filename} locally and verified file integrity.`,
-        };
-      } catch (err) {
-        const errMsg =
-          err instanceof Error ? err.message : 'Integrity verification failed.';
-        appendActivity({
-          category: 'security',
-          title: `Blocked chat decryption for ${targetFile.filename}`,
-          detail: errMsg,
-          status: 'warning',
-          statusLabel: 'Blocked',
-        });
-        return {
-          state: 'error',
-          message: `Unable to decrypt ${targetFile.filename}: ${errMsg}`,
-        };
-      }
-    }
-
-    const check = verifyFileIntegrity(targetFile);
-    if (!check.valid) {
-      appendActivity({
+    try {
+      const result = await decryptPayloadWithWebCrypto({
+        envelope: targetFile.crypto,
+        privateKey: user.privateKey,
+        recipientId: user.id,
+        recipientFingerprint: user.keyFingerprint,
+      });
+      const copy = new Uint8Array(result.plaintextBytes.byteLength);
+      copy.set(result.plaintextBytes);
+      triggerDownload(
+        new Blob([copy.buffer], {
+          type: targetFile.mimeType || 'application/octet-stream',
+        }),
+        targetFile.filename
+      );
+      await recordClientActivity({
+        category: 'file',
+        title: `${user.name} decrypted ${targetFile.filename} from chat`,
+        detail: 'Verified integrity locally and decrypted shared attachment.',
+        status: 'success',
+        statusLabel: 'Verified',
+      });
+      return {
+        state: 'success',
+        message: `Decrypted ${targetFile.filename} locally and verified file integrity.`,
+      };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Integrity verification failed.';
+      await recordClientActivity({
         category: 'security',
-        title: `Integrity alert blocked ${targetFile.filename} in chat`,
-        detail: 'File integrity verification failed and download was blocked.',
+        title: `Blocked chat decryption for ${targetFile.filename}`,
+        detail: errMsg,
         status: 'warning',
-        statusLabel: 'Integrity Alert',
+        statusLabel: 'Blocked',
       });
       return {
         state: 'error',
-        message: `Blocked download for ${targetFile.filename}: file integrity verification failed.`,
+        message: `Unable to decrypt ${targetFile.filename}: ${errMsg}`,
       };
     }
-
-    triggerDownload(
-      new Blob(
-        [`${targetFile.decryptedPreviewContent}\n\n---\nDecrypted locally by CipherHall\n`],
-        { type: 'text/plain;charset=utf-8' }
-      ),
-      `decrypted_${targetFile.filename.replace(/\.[^.]+$/, '')}.txt`
-    );
-    appendActivity({
-      category: 'file',
-      title: `${user.name} decrypted ${targetFile.filename} from chat`,
-      detail: 'Verified integrity locally and downloaded shared attachment.',
-      status: 'success',
-      statusLabel: 'Verified',
-    });
-    return {
-      state: 'success',
-      message: `Decrypted ${targetFile.filename} locally and verified file integrity.`,
-    };
   };
 
   const handleSelectView = (view: WorkspaceView) => {
@@ -609,7 +481,7 @@ export default function App() {
     }
   };
 
-  if (!user) {
+  if (!user || !authToken) {
     return <AuthScreen onAuthenticated={handleAuthenticated} />;
   }
 
@@ -620,7 +492,7 @@ export default function App() {
         activeView={activeView}
         onSelectView={handleSelectView}
         fileCount={files.length}
-        unreadChatCount={unreadChatCount}
+        unreadChatCount={0}
         activityCount={activityLog.length}
         onSignOut={handleSignOut}
         mobileOpen={mobileNavOpen}
@@ -643,10 +515,7 @@ export default function App() {
           role="note"
           className="px-3 sm:px-6 py-2 bg-[#0E1420]/90 border-b border-slate-800/80 flex items-center gap-2 text-xs text-slate-400 shrink-0"
         >
-          <ShieldCheck
-            className="h-3.5 w-3.5 text-emerald-400 shrink-0"
-            aria-hidden="true"
-          />
+          <ShieldCheck className="h-3.5 w-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
           <p className="truncate sm:whitespace-normal">
             Your files and messages are encrypted on your device before leaving your browser.
             Not even campus IT admins can read them.
@@ -672,8 +541,8 @@ export default function App() {
                 onSelectFile={handleSelectFile}
                 onOpenUploadModal={() => setUploadModalOpen(true)}
                 onManageAccess={(file) => setManageAccessFile(file)}
-                onDecryptActivity={({ file, success, detail }) =>
-                  appendActivity({
+                onDecryptActivity={({ file, success, detail }) => {
+                  void recordClientActivity({
                     category: success ? 'file' : 'security',
                     title: success
                       ? `${user.name} decrypted & verified ${file.filename}`
@@ -681,14 +550,14 @@ export default function App() {
                     detail,
                     status: success ? 'success' : 'warning',
                     statusLabel: success ? 'Verified' : 'Integrity Alert',
-                  })
-                }
+                  });
+                }}
               />
             )}
 
             {activeView === 'chat' && (
               <EncryptedChat
-                threads={displayThreads}
+                threads={chatThreads}
                 activeThreadId={activeThreadId}
                 selectedMessageId={
                   inspectorTarget?.kind === 'message' ? inspectorTarget.message.id : null
@@ -715,30 +584,30 @@ export default function App() {
       <UploadEncryptModal
         open={uploadModalOpen}
         onClose={() => setUploadModalOpen(false)}
-        recipients={syncedRecipients}
+        recipients={registeredUsers}
         currentUser={user}
-        onFileEncrypted={handleFileEncrypted}
+        onUploadEncryptedFile={handleUploadEncryptedFile}
       />
 
       <SecurityBackupModal
         open={securityModalOpen}
         user={user}
         onClose={() => setSecurityModalOpen(false)}
-        onBackupDownloaded={(filename) =>
-          appendActivity({
+        onBackupDownloaded={(filename) => {
+          void recordClientActivity({
             category: 'security',
             title: `${user.name} downloaded encrypted key backup`,
             detail: `Saved passphrase-protected backup file (${filename}) to this device.`,
             status: 'success',
             statusLabel: 'Protected',
-          })
-        }
+          });
+        }}
       />
 
       <ManageAccessModal
         file={manageAccessFile}
         currentUser={user}
-        allRecipients={syncedRecipients}
+        allRecipients={registeredUsers}
         onClose={() => setManageAccessFile(null)}
         onSaveAccess={handleSaveFileAccess}
       />

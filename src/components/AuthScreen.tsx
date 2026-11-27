@@ -1,22 +1,18 @@
 import React, { useState } from 'react';
 import { Eye, EyeOff, KeyRound, Loader2, Lock, ShieldCheck } from 'lucide-react';
+import { loginUserApi, registerUserApi } from '../services/vaultApi';
 import type { UserProfile, UserRole } from '../types/vault';
 import {
   evaluatePassphraseStrength,
   generateUserKeyBundle,
-  importPublicKeyFromJwk,
+  importPublicKeyFromSpkiBase64,
+  INSTITUTION_NAME,
   unlockPrivateKeyWithPassphrase,
   validateAuthForm,
 } from '../utils/cryptoEngine';
-import {
-  login,
-  logout,
-  pushKeyMaterial,
-  register,
-} from '../utils/apiClient';
 
 interface AuthScreenProps {
-  onAuthenticated: (user: UserProfile) => void;
+  onAuthenticated: (session: { user: UserProfile; token: string }) => void;
 }
 
 export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
@@ -25,11 +21,13 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [role, setRole] = useState<UserRole>('Student');
+  const [department, setDepartment] = useState('');
   const [passphrase, setPassphrase] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showPassphrase, setShowPassphrase] = useState(false);
-  const [isDerivingKeys, setIsDerivingKeys] = useState(false);
-  const [cryptoError, setCryptoError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [statusText, setStatusText] = useState('');
+  const [authError, setAuthError] = useState<string | null>(null);
   const [errors, setErrors] = useState<
     Partial<Record<'name' | 'email' | 'password' | 'passphrase', string>>
   >({});
@@ -39,30 +37,12 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
   const handleModeSwitch = (nextMode: 'login' | 'register') => {
     setMode(nextMode);
     setErrors({});
-    setCryptoError(null);
-  };
-
-  const applyDemoPreset = (presetRole: UserRole) => {
-    setErrors({});
-    setCryptoError(null);
-    if (presetRole === 'Faculty') {
-      setName('Dr. Elena Vance');
-      setEmail('e.vance@jbitdoon.edu.in');
-      setPassword('JBITFaculty2026');
-      setRole('Faculty');
-      setPassphrase('lattice-ivory-cipher-410');
-    } else {
-      setName('Maya Lin');
-      setEmail('m.lin@jbitdoon.edu.in');
-      setPassword('JBITStudent2026');
-      setRole('Student');
-      setPassphrase('cedar-lattice-410');
-    }
+    setAuthError(null);
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    setCryptoError(null);
+    setAuthError(null);
     const validation = validateAuthForm({
       mode,
       name,
@@ -77,113 +57,96 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
       return;
     }
 
-    setIsDerivingKeys(true);
+    setIsSubmitting(true);
     try {
       const normalizedEmail = email.trim().toLowerCase();
-
-      let resolvedId: string;
-      let resolvedName2: string;
-      let resolvedDept: string;
-      let resolvedRole: UserRole;
-      let finalPublicKey: CryptoKey;
-      let finalPrivateKey: CryptoKey;
-      let finalFingerprint: string;
-      let finalProtectedPrivateKey: import('../types/vault').ProtectedPrivateKeyBundle;
+      const unlockedAt = new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
 
       if (mode === 'register') {
-        // ── REGISTER ────────────────────────────────────────────────────────────
-        // Generate a fresh RSA-OAEP-2048 key pair + PBKDF2-AES-GCM-wrapped
-        // private key entirely in the browser. Passphrase NEVER leaves device.
-        const resolvedName = name.trim() || normalizedEmail.split('@')[0] || 'Campus Member';
-        const department =
-          role === 'Faculty' ? 'Applied Cryptography' : 'Computer Science (M.S.)';
-
+        setStatusText('Generating RSA-OAEP-2048 Key Pair…');
         const keyMaterial = await generateUserKeyBundle(passphrase);
 
-        const res = await register({
-          name: resolvedName,
+        setStatusText('Creating Encrypted Campus Account…');
+        const response = await registerUserApi({
+          name: name.trim(),
           email: normalizedEmail,
           password,
           role,
-          department,
-          publicKeyJwk: keyMaterial.publicKeyJwk,
+          department: department.trim() || undefined,
           keyFingerprint: keyMaterial.keyFingerprint,
+          publicKeySpkiBase64: keyMaterial.publicKeySpkiBase64,
           protectedPrivateKey: keyMaterial.protectedPrivateKey,
         });
 
-        resolvedId = res.user.id;
-        resolvedName2 = res.user.name;
-        resolvedDept = res.user.department;
-        resolvedRole = res.user.role;
-        finalPublicKey = keyMaterial.publicKey;
-        finalPrivateKey = keyMaterial.privateKey;
-        finalFingerprint = keyMaterial.keyFingerprint;
-        finalProtectedPrivateKey = keyMaterial.protectedPrivateKey;
+        onAuthenticated({
+          token: response.token,
+          user: {
+            id: response.user.id,
+            name: response.user.name,
+            email: response.user.email,
+            role: response.user.role,
+            department: response.user.department,
+            keyFingerprint: response.user.keyFingerprint,
+            publicKeySpkiBase64: response.user.publicKeySpkiBase64,
+            publicKey: keyMaterial.publicKey,
+            privateKey: keyMaterial.privateKey,
+            protectedPrivateKey: response.user.protectedPrivateKey,
+            vaultUnlockedAt: unlockedAt,
+          },
+        });
       } else {
-        // ── LOGIN ────────────────────────────────────────────────────────────────
-        // Authenticate with the server and get back the OPAQUE private-key bundle.
-        // We then use the Vault Passphrase (which never leaves the browser) to
-        // PBKDF2-unwrap the private key locally. If the server has no stored key
-        // material yet (first login after migration), we generate a new pair and
-        // push it.
-        const res = await login({ email: normalizedEmail, password });
-        resolvedId = res.user.id;
-        resolvedName2 = res.user.name;
-        resolvedDept = res.user.department;
-        resolvedRole = res.user.role;
+        setStatusText('Verifying Campus Credentials…');
+        const response = await loginUserApi({
+          email: normalizedEmail,
+          password,
+        });
 
-        if (res.protectedPrivateKey && res.publicKeyJwk) {
-          // ✅ Normal path: unwrap the SAME private key that was used to encrypt
-          //    wrapped AES keys during previous uploads.
-          const bundle = res.protectedPrivateKey as import('../types/vault').ProtectedPrivateKeyBundle;
-          finalPrivateKey = await unlockPrivateKeyWithPassphrase(bundle, passphrase);
-          finalPublicKey = await importPublicKeyFromJwk(res.publicKeyJwk);
-          finalProtectedPrivateKey = bundle;
-          // Recompute fingerprint from the stored public key JWK
-          const { computePublicKeyFingerprint } = await import('../utils/cryptoEngine');
-          finalFingerprint = await computePublicKeyFingerprint(finalPublicKey);
-        } else {
-          // ⚠️ First login after migration – no key material on server yet.
-          // Generate a new pair, push it. The user will need to re-upload files
-          // (or we could skip file display for un-keyed files).
-          const keyMaterial = await generateUserKeyBundle(passphrase);
-          await pushKeyMaterial({
-            publicKeyJwk: keyMaterial.publicKeyJwk,
-            keyFingerprint: keyMaterial.keyFingerprint,
-            protectedPrivateKey: keyMaterial.protectedPrivateKey,
-          }).catch(() => { /* non-critical */ });
-          finalPublicKey = keyMaterial.publicKey;
-          finalPrivateKey = keyMaterial.privateKey;
-          finalFingerprint = keyMaterial.keyFingerprint;
-          finalProtectedPrivateKey = keyMaterial.protectedPrivateKey;
+        setStatusText('Unlocking Local RSA-2048 Private Key…');
+        let unlockedPrivateKey: CryptoKey;
+        try {
+          unlockedPrivateKey = await unlockPrivateKeyWithPassphrase(
+            response.user.protectedPrivateKey,
+            passphrase
+          );
+        } catch {
+          throw new Error(
+            'Incorrect Vault Passphrase. Your local private key could not be unlocked.'
+          );
         }
-      }
 
-      onAuthenticated({
-        id: resolvedId,
-        name: resolvedName2,
-        email: normalizedEmail,
-        role: resolvedRole,
-        department: resolvedDept,
-        keyFingerprint: finalFingerprint,
-        publicKey: finalPublicKey,
-        privateKey: finalPrivateKey,
-        protectedPrivateKey: finalProtectedPrivateKey,
-        vaultUnlockedAt: new Date().toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-      });
+        const importedPublicKey = await importPublicKeyFromSpkiBase64(
+          response.user.publicKeySpkiBase64
+        );
+
+        onAuthenticated({
+          token: response.token,
+          user: {
+            id: response.user.id,
+            name: response.user.name,
+            email: response.user.email,
+            role: response.user.role,
+            department: response.user.department,
+            keyFingerprint: response.user.keyFingerprint,
+            publicKeySpkiBase64: response.user.publicKeySpkiBase64,
+            publicKey: importedPublicKey,
+            privateKey: unlockedPrivateKey,
+            protectedPrivateKey: response.user.protectedPrivateKey,
+            vaultUnlockedAt: unlockedAt,
+          },
+        });
+      }
     } catch (err) {
-      // Clear any stored token so a retry starts fresh
-      logout();
-      setCryptoError(
+      setAuthError(
         err instanceof Error
           ? err.message
-          : 'Authentication failed. Check your credentials and Vault Passphrase.'
+          : 'Authentication failed. Please check your credentials and try again.'
       );
     } finally {
-      setIsDerivingKeys(false);
+      setIsSubmitting(false);
+      setStatusText('');
     }
   };
 
@@ -210,9 +173,7 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
           </div>
 
           <div className="mt-12 lg:mt-20 max-w-lg">
-            <p className="text-sm font-medium text-blue-400">
-              JB Institute of Technology, Dehradun
-            </p>
+            <p className="text-sm font-medium text-blue-400">{INSTITUTION_NAME}</p>
             <h1 className="mt-3 font-display text-3xl sm:text-4xl font-bold tracking-tight text-slate-50 leading-tight [text-wrap:balance]">
               Zero-knowledge file vault and encrypted campus messaging.
             </h1>
@@ -246,7 +207,7 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
 
         <p className="mt-10 text-xs text-slate-500">
           Private keys are generated via Web Crypto API and wrapped locally with your Vault
-          Passphrase—never leaving your browser.
+          Passphrase—never leaving your browser unencrypted.
         </p>
       </section>
 
@@ -293,63 +254,41 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
             </h2>
             <p className="mt-1.5 text-sm text-slate-400">
               {mode === 'login'
-                ? 'Authenticate and enter your Vault Passphrase to unwrap your local RSA private key.'
-                : 'Provision a new Student or Faculty identity and generate a passphrase-protected keypair.'}
+                ? 'Sign in with your registered institute account and enter your Vault Passphrase to unwrap your local RSA private key.'
+                : 'Create your Student or Faculty account and generate a personal passphrase-protected RSA-2048 keypair.'}
             </p>
           </div>
 
-          {/* Quick Demo Fill */}
-          <div className="mt-5 flex flex-wrap items-center justify-between gap-2 py-2.5 px-3.5 rounded-lg bg-[#111824] border border-slate-800/80">
-            <span className="text-xs text-slate-400">Quick demo credentials</span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => applyDemoPreset('Student')}
-                className="px-2.5 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-              >
-                Fill Student
-              </button>
-              <button
-                type="button"
-                onClick={() => applyDemoPreset('Faculty')}
-                className="px-2.5 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-              >
-                Fill Faculty
-              </button>
-            </div>
-          </div>
-
           <form onSubmit={handleSubmit} noValidate className="mt-6 space-y-4">
-            {/* Name field: visible on both modes (required in Register, optional display name in Login) */}
-            <div>
-              <label
-                htmlFor="auth-name"
-                className="block text-sm font-medium text-slate-300 mb-1.5"
-              >
-                Full Name{' '}
-                {mode === 'login' && (
-                  <span className="text-xs font-normal text-slate-500">(optional)</span>
+            {/* Full Name (Registration only) */}
+            {mode === 'register' && (
+              <div>
+                <label
+                  htmlFor="auth-name"
+                  className="block text-sm font-medium text-slate-300 mb-1.5"
+                >
+                  Full Name
+                </label>
+                <input
+                  id="auth-name"
+                  type="text"
+                  autoComplete="name"
+                  value={name}
+                  onChange={(e) => {
+                    setName(e.target.value);
+                    if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }));
+                  }}
+                  placeholder="Enter your full name"
+                  aria-invalid={Boolean(errors.name)}
+                  className="w-full h-11 px-3.5 rounded-lg bg-[#111824] border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+                />
+                {errors.name && (
+                  <p role="alert" className="mt-1.5 text-xs text-rose-400">
+                    {errors.name}
+                  </p>
                 )}
-              </label>
-              <input
-                id="auth-name"
-                type="text"
-                autoComplete="name"
-                value={name}
-                onChange={(e) => {
-                  setName(e.target.value);
-                  if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }));
-                }}
-                placeholder={role === 'Faculty' ? 'Dr. Elena Vance' : 'Maya Lin'}
-                aria-invalid={Boolean(errors.name)}
-                className="w-full h-11 px-3.5 rounded-lg bg-[#111824] border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
-              />
-              {errors.name && (
-                <p role="alert" className="mt-1.5 text-xs text-rose-400">
-                  {errors.name}
-                </p>
-              )}
-            </div>
+              </div>
+            )}
 
             {/* Email */}
             <div>
@@ -422,32 +361,54 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
               )}
             </div>
 
-            {/* Role Selector (Student / Faculty) */}
-            <fieldset>
-              <legend className="block text-sm font-medium text-slate-300 mb-1.5">
-                Academic Role
-              </legend>
-              <div className="grid grid-cols-2 gap-3">
-                {(['Student', 'Faculty'] as UserRole[]).map((option) => {
-                  const isSelected = role === option;
-                  return (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() => setRole(option)}
-                      aria-pressed={isSelected}
-                      className={`h-11 px-4 rounded-lg border text-sm font-medium transition-colors flex items-center justify-center gap-2 whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-                        isSelected
-                          ? 'bg-blue-600/15 border-blue-500 text-blue-300'
-                          : 'bg-[#111824] border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
-                      }`}
-                    >
-                      <span>{option}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </fieldset>
+            {/* Role Selector & Department (Registration only) */}
+            {mode === 'register' && (
+              <>
+                <fieldset>
+                  <legend className="block text-sm font-medium text-slate-300 mb-1.5">
+                    Academic Role
+                  </legend>
+                  <div className="grid grid-cols-2 gap-3">
+                    {(['Student', 'Faculty'] as UserRole[]).map((option) => {
+                      const isSelected = role === option;
+                      return (
+                        <button
+                          key={option}
+                          type="button"
+                          onClick={() => setRole(option)}
+                          aria-pressed={isSelected}
+                          className={`h-11 px-4 rounded-lg border text-sm font-medium transition-colors flex items-center justify-center gap-2 whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                            isSelected
+                              ? 'bg-blue-600/15 border-blue-500 text-blue-300'
+                              : 'bg-[#111824] border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                          }`}
+                        >
+                          <span>{option}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+
+                <div>
+                  <label
+                    htmlFor="auth-department"
+                    className="block text-sm font-medium text-slate-300 mb-1.5"
+                  >
+                    Department{' '}
+                    <span className="text-xs font-normal text-slate-500">(optional)</span>
+                  </label>
+                  <input
+                    id="auth-department"
+                    type="text"
+                    value={department}
+                    onChange={(e) => setDepartment(e.target.value)}
+                    placeholder="e.g. Computer Science & Engineering"
+                    className="w-full h-11 px-3.5 rounded-lg bg-[#111824] border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+                  />
+                </div>
+              </>
+            )}
 
             {/* Vault Passphrase */}
             <div className="pt-2 border-t border-slate-800/80">
@@ -460,9 +421,7 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
                   <span>Vault Passphrase</span>
                 </label>
                 {passphrase.length > 0 && (
-                  <span className="text-xs font-mono text-slate-400">
-                    {strength.label}
-                  </span>
+                  <span className="text-xs font-mono text-slate-400">{strength.label}</span>
                 )}
               </div>
               <div className="relative">
@@ -475,7 +434,11 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
                     if (errors.passphrase)
                       setErrors((prev) => ({ ...prev, passphrase: undefined }));
                   }}
-                  placeholder="Enter passphrase to unlock RSA private key"
+                  placeholder={
+                    mode === 'register'
+                      ? 'Create a passphrase to protect your RSA private key'
+                      : 'Enter your passphrase to unlock your RSA private key'
+                  }
                   aria-invalid={Boolean(errors.passphrase)}
                   className="w-full h-11 pl-3.5 pr-11 rounded-lg bg-[#111824] border border-slate-800 font-mono text-sm text-slate-100 placeholder:font-sans placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
                 />
@@ -508,7 +471,8 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
                 ))}
               </div>
               <p className="mt-1.5 text-xs text-slate-500">
-                Used locally with PBKDF2-SHA256 to decrypt your stored private key.
+                Used locally with PBKDF2-SHA256 to protect and unlock your private key on this
+                device. Never sent to the server.
               </p>
               {errors.passphrase && (
                 <p role="alert" className="mt-1 text-xs text-rose-400">
@@ -517,31 +481,32 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
               )}
             </div>
 
-            {cryptoError && (
-              <p role="alert" className="text-xs text-rose-400">
-                {cryptoError}
+            {authError && (
+              <p
+                role="alert"
+                className="px-3.5 py-2.5 rounded-lg bg-rose-950/40 border border-rose-500/35 text-xs text-rose-300"
+              >
+                {authError}
               </p>
             )}
 
             <button
               type="submit"
-              disabled={isDerivingKeys}
+              disabled={isSubmitting}
               className="w-full h-11 mt-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:bg-blue-700/60 disabled:cursor-wait text-sm font-semibold text-white transition-colors flex items-center justify-center gap-2 whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0B0F17]"
             >
-              {isDerivingKeys ? (
+              {isSubmitting ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  <span>
-                    {mode === 'login' ? 'Authenticating & Unlocking Key…' : 'Generating RSA-OAEP-2048 Key Pair…'}
-                  </span>
+                  <span>{statusText || 'Processing…'}</span>
                 </>
               ) : (
                 <>
                   <Lock className="h-4 w-4" aria-hidden="true" />
                   <span>
                     {mode === 'login'
-                      ? 'Sign In & Unlock Private Key'
-                      : 'Register & Generate Key Pair'}
+                      ? 'Unlock Private Key & Enter Vault'
+                      : 'Generate Key & Create Account'}
                   </span>
                 </>
               )}

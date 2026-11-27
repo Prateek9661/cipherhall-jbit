@@ -16,7 +16,6 @@ import {
   decryptPayloadWithWebCrypto,
   filterVaultFiles,
   formatByteSize,
-  verifyFileIntegrity,
 } from '../utils/cryptoEngine';
 import { SecurityTooltip } from './SecurityTooltip';
 
@@ -96,105 +95,72 @@ export function DocumentVault({
   const handleDecryptAndDownload = async (file: VaultFile) => {
     onSelectFile(file);
 
-    // Real Web Crypto path for newly uploaded files
-    if (file.crypto.isWebCryptoReal && file.crypto.rawCiphertextBase64) {
-      if (!currentUser.privateKey) {
-        setDecryptFeedback({
-          fileId: file.id,
-          filename: file.filename,
-          state: 'error',
-          message:
-            'Your vault key is still initializing. Please try again in a moment.',
-        });
-        return;
-      }
-
-      setDecryptingFileId(file.id);
-      try {
-        const result = await decryptPayloadWithWebCrypto({
-          envelope: file.crypto,
-          privateKey: currentUser.privateKey,
-          recipientId: currentUser.id,
-          recipientFingerprint: currentUser.keyFingerprint,
-        });
-
-        const bytesCopy = new Uint8Array(result.plaintextBytes.byteLength);
-        bytesCopy.set(result.plaintextBytes);
-        const blob = new Blob([bytesCopy.buffer], {
-          type: file.mimeType || 'application/octet-stream',
-        });
-        triggerBrowserDownload(blob, file.filename);
-
-        const successMsg = `Decrypted ${file.filename} (${formatByteSize(
-          result.plaintextBytes.byteLength
-        )}) locally and verified file integrity.`;
-        setDecryptFeedback({
-          fileId: file.id,
-          filename: file.filename,
-          state: 'success',
-          message: successMsg,
-        });
-        onDecryptActivity?.({
-          file,
-          success: true,
-          detail: `Verified integrity locally and decrypted ${file.filename} on this device.`,
-        });
-      } catch (err) {
-        const errMsg =
-          err instanceof Error ? err.message : 'Integrity verification failed.';
-        setDecryptFeedback({
-          fileId: file.id,
-          filename: file.filename,
-          state: 'error',
-          message: `Unable to decrypt ${file.filename}: ${errMsg}`,
-        });
-        onDecryptActivity?.({
-          file,
-          success: false,
-          detail: `Decryption blocked for ${file.filename}: ${errMsg}`,
-        });
-      } finally {
-        setDecryptingFileId(null);
-      }
-      return;
-    }
-
-    // Pre-seeded demo files path
-    const check = verifyFileIntegrity(file);
-    if (!check.valid) {
+    if (!file.crypto.rawCiphertextBase64) {
       setDecryptFeedback({
         fileId: file.id,
         filename: file.filename,
         state: 'error',
-        message: `Blocked download for ${file.filename}: file integrity verification failed.`,
-      });
-      onDecryptActivity?.({
-        file,
-        success: false,
-        detail: `Automatically blocked download of ${file.filename} due to an integrity alert.`,
+        message: `Encrypted file payload is missing for ${file.filename}.`,
       });
       return;
     }
 
-    const blob = new Blob(
-      [
-        `${file.decryptedPreviewContent}\n\n---\nDecrypted locally by CipherHall\n`,
-      ],
-      { type: 'text/plain;charset=utf-8' }
-    );
-    triggerBrowserDownload(blob, `decrypted_${file.filename.replace(/\.[^.]+$/, '')}.txt`);
+    if (!currentUser.privateKey) {
+      setDecryptFeedback({
+        fileId: file.id,
+        filename: file.filename,
+        state: 'error',
+        message: 'Your vault key is still initializing. Please try again in a moment.',
+      });
+      return;
+    }
 
-    setDecryptFeedback({
-      fileId: file.id,
-      filename: file.filename,
-      state: 'success',
-      message: `Decrypted ${file.filename} locally and verified file integrity.`,
-    });
-    onDecryptActivity?.({
-      file,
-      success: true,
-      detail: `Verified integrity locally and downloaded ${file.filename}.`,
-    });
+    setDecryptingFileId(file.id);
+    try {
+      const result = await decryptPayloadWithWebCrypto({
+        envelope: file.crypto,
+        privateKey: currentUser.privateKey,
+        recipientId: currentUser.id,
+        recipientFingerprint: currentUser.keyFingerprint,
+      });
+
+      const bytesCopy = new Uint8Array(result.plaintextBytes.byteLength);
+      bytesCopy.set(result.plaintextBytes);
+      const blob = new Blob([bytesCopy.buffer], {
+        type: file.mimeType || 'application/octet-stream',
+      });
+      triggerBrowserDownload(blob, file.filename);
+
+      const successMsg = `Decrypted ${file.filename} (${formatByteSize(
+        result.plaintextBytes.byteLength
+      )}) locally and verified file integrity.`;
+      setDecryptFeedback({
+        fileId: file.id,
+        filename: file.filename,
+        state: 'success',
+        message: successMsg,
+      });
+      onDecryptActivity?.({
+        file,
+        success: true,
+        detail: `Verified integrity locally and decrypted ${file.filename} on this device.`,
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Integrity verification failed.';
+      setDecryptFeedback({
+        fileId: file.id,
+        filename: file.filename,
+        state: 'error',
+        message: `Unable to decrypt ${file.filename}: ${errMsg}`,
+      });
+      onDecryptActivity?.({
+        file,
+        success: false,
+        detail: `Decryption blocked for ${file.filename}: ${errMsg}`,
+      });
+    } finally {
+      setDecryptingFileId(null);
+    }
   };
 
   const activeBanner = decryptFeedback
@@ -341,7 +307,27 @@ export function DocumentVault({
 
       {/* Encrypted Files Table */}
       <div className="rounded-xl border border-slate-800/90 bg-[#111824] overflow-hidden">
-        {filteredFiles.length === 0 ? (
+        {files.length === 0 ? (
+          <div className="py-16 px-6 text-center">
+            <FileText className="h-9 w-9 text-slate-600 mx-auto" aria-hidden="true" />
+            <h2 className="mt-3 font-display text-base font-medium text-slate-200">
+              No encrypted files yet
+            </h2>
+            <p className="mt-1 text-sm text-slate-400 max-w-md mx-auto">
+              No encrypted files yet. Click Upload &amp; Encrypt to add your first document.
+            </p>
+            <div className="mt-5 flex items-center justify-center">
+              <button
+                type="button"
+                onClick={onOpenUploadModal}
+                className="h-9 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-medium text-white transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <Upload className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Upload &amp; Encrypt</span>
+              </button>
+            </div>
+          </div>
+        ) : filteredFiles.length === 0 ? (
           <div className="py-16 px-6 text-center">
             <FileText className="h-9 w-9 text-slate-600 mx-auto" aria-hidden="true" />
             <h2 className="mt-3 font-display text-base font-medium text-slate-200">

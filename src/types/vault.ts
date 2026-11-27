@@ -20,6 +20,7 @@ export interface UserProfile {
   role: UserRole;
   department: string;
   keyFingerprint: string;
+  publicKeySpkiBase64?: string;
   vaultUnlockedAt: string;
   publicKey?: CryptoKey;
   privateKey?: CryptoKey;
@@ -33,7 +34,19 @@ export interface Recipient {
   role: UserRole;
   department: string;
   keyFingerprint: string;
+  publicKeySpkiBase64?: string;
   publicKey?: CryptoKey;
+}
+
+export interface AuthUserDTO {
+  id: string;
+  name: string;
+  email: string;
+  role: UserRole;
+  department: string;
+  keyFingerprint: string;
+  publicKeySpkiBase64: string;
+  protectedPrivateKey: ProtectedPrivateKeyBundle;
 }
 
 export interface WrappedRecipientKey {
@@ -66,13 +79,15 @@ export interface VaultFile {
   fileType: string;
   mimeType?: string;
   sizeBytes: number;
+  uploaderId?: string;
   uploadedBy: string;
   uploadedByRole: UserRole;
   department: string;
   uploadedAt: string;
   dateLabel: string;
   sha256Status: IntegrityStatus;
-  decryptedPreviewContent: string;
+  decryptedPreviewContent?: string;
+  recipientIds?: string[];
   recipients: string[];
   crypto: CryptoEnvelope;
 }
@@ -82,6 +97,18 @@ export interface ChatFileAttachment {
   filename: string;
   sizeBytes: number;
   sha256Status: IntegrityStatus;
+}
+
+export interface StoredEncryptedMessageDTO {
+  id: string;
+  senderId: string;
+  senderName: string;
+  senderRole: UserRole;
+  recipientId: string;
+  timestamp: string;
+  createdAt: string;
+  attachedFile?: ChatFileAttachment;
+  crypto: CryptoEnvelope;
 }
 
 export interface ChatMessage {
@@ -102,6 +129,7 @@ export interface ChatThread {
   title: string;
   type: 'direct' | 'group';
   subtitle: string;
+  participantEmail?: string;
   participantRole?: UserRole;
   memberCount: number;
   recipientIds: string[];

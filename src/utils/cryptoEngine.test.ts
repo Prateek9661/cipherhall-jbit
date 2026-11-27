@@ -9,14 +9,17 @@ import {
   decryptPayloadWithWebCrypto,
   encryptPayloadWithWebCrypto,
   evaluatePassphraseStrength,
+  exportPublicKeyToSpkiBase64,
   filterActivityEvents,
   filterVaultFiles,
   formatByteSize,
   formatHexSpaced,
   formatShortHash,
   generateUserKeyBundle,
+  importPublicKeyFromSpkiBase64,
   INSTITUTION_NAME,
   PBKDF2_ITERATIONS,
+  rewrapAesKeyForRecipients,
   unlockPrivateKeyWithPassphrase,
   updateFileRecipientAccess,
   validateAuthForm,
@@ -42,7 +45,7 @@ test('validateAuthForm rejects missing required fields and invalid email', () =>
   const validLogin = validateAuthForm({
     mode: 'login',
     name: '',
-    email: 'm.lin@jbitdoon.edu.in',
+    email: 'student1@jbitdoon.edu.in',
     password: 'strongpassword123',
     role: 'Student',
     passphrase: 'orbit-cedar-cipher-9',
@@ -58,17 +61,24 @@ test('evaluatePassphraseStrength classifies passphrases accurately', () => {
   assert.equal(evaluatePassphraseStrength('CampusVault2026!').label, 'Hardened');
 });
 
-test('generateUserKeyBundle creates real RSA-OAEP-2048 key pair protected by PBKDF2-SHA256 Vault Passphrase', async () => {
+test('generateUserKeyBundle creates real RSA-OAEP-2048 key pair with SPKI export protected by PBKDF2-SHA256', async () => {
   const passphrase = 'cedar-lattice-vault-2026';
   const bundle = await generateUserKeyBundle(passphrase);
 
   assert.equal(bundle.publicKey.algorithm.name, 'RSA-OAEP');
   assert.equal(bundle.privateKey.algorithm.name, 'RSA-OAEP');
+  assert.ok(bundle.publicKeySpkiBase64.length > 200);
   assert.equal(bundle.protectedPrivateKey.kdf, 'PBKDF2-SHA256');
   assert.equal(bundle.protectedPrivateKey.iterations, PBKDF2_ITERATIONS);
   assert.equal(bundle.protectedPrivateKey.wrapAlgorithm, 'AES-256-GCM');
   assert.equal(bundle.protectedPrivateKey.wrapIvHex.length, 24);
   assert.match(bundle.keyFingerprint, /^([0-9A-F]{4}:){4}[0-9A-F]{4}$/);
+
+  const reExported = await exportPublicKeyToSpkiBase64(bundle.publicKey);
+  assert.equal(reExported, bundle.publicKeySpkiBase64);
+
+  const importedPublic = await importPublicKeyFromSpkiBase64(bundle.publicKeySpkiBase64);
+  assert.equal(importedPublic.algorithm.name, 'RSA-OAEP');
 
   const unlocked = await unlockPrivateKeyWithPassphrase(
     bundle.protectedPrivateKey,
@@ -82,33 +92,34 @@ test('generateUserKeyBundle creates real RSA-OAEP-2048 key pair protected by PBK
   );
 });
 
-test('encryptPayloadWithWebCrypto and decryptPayloadWithWebCrypto perform full real AES-256-GCM + RSA-OAEP-2048 round-trip', async () => {
-  const aliceKeys = await generateUserKeyBundle('alice-passphrase-2026');
-  const bobKeys = await generateUserKeyBundle('bob-passphrase-2026');
-  const charlieKeys = await generateUserKeyBundle('charlie-passphrase-2026');
+test('encryptPayloadWithWebCrypto imports SPKI public keys from registered users and decrypts end-to-end', async () => {
+  const facultyKeys = await generateUserKeyBundle('faculty-passphrase-2026');
+  const studentKeys = await generateUserKeyBundle('student-passphrase-2026');
+  const outsiderKeys = await generateUserKeyBundle('outsider-passphrase-2026');
 
+  // Pass SPKI base64 strings only (matching GET /api/users response from MongoDB)
   const recipients: Recipient[] = [
     {
-      id: 'usr-alice',
-      name: 'Dr. Elena Vance',
-      email: 'e.vance@jbitdoon.edu.in',
+      id: 'usr-fac-1',
+      name: 'Test Faculty',
+      email: 'faculty1@jbitdoon.edu.in',
       role: 'Faculty',
-      department: 'Applied Cryptography',
-      keyFingerprint: aliceKeys.keyFingerprint,
-      publicKey: aliceKeys.publicKey,
+      department: 'Computer Science & Engineering',
+      keyFingerprint: facultyKeys.keyFingerprint,
+      publicKeySpkiBase64: facultyKeys.publicKeySpkiBase64,
     },
     {
-      id: 'usr-bob',
-      name: 'Maya Lin',
-      email: 'm.lin@jbitdoon.edu.in',
+      id: 'usr-stu-1',
+      name: 'Test Student',
+      email: 'student1@jbitdoon.edu.in',
       role: 'Student',
-      department: 'Computer Science',
-      keyFingerprint: bobKeys.keyFingerprint,
-      publicKey: bobKeys.publicKey,
+      department: 'Computer Science & Engineering',
+      keyFingerprint: studentKeys.keyFingerprint,
+      publicKeySpkiBase64: studentKeys.publicKeySpkiBase64,
     },
   ];
 
-  const plaintextString = 'CS-410 Final Exam Key — Real Web Crypto AES-256-GCM + RSA-OAEP-2048!';
+  const plaintextString = 'JBIT Operating Systems Lab Manual — Real Web Crypto AES-256-GCM + RSA-OAEP-2048!';
   const plaintextBytes = new TextEncoder().encode(plaintextString);
   const expectedSha256 = await computeSha256Hex(plaintextBytes);
 
@@ -131,27 +142,59 @@ test('encryptPayloadWithWebCrypto and decryptPayloadWithWebCrypto perform full r
     envelope.wrappedKeys[1].wrappedKeyBase64
   );
 
+  // Student decrypts with their own RSA-OAEP-2048 private key
   const decrypted = await decryptPayloadWithWebCrypto({
     envelope,
-    privateKey: bobKeys.privateKey,
-    recipientId: 'usr-bob',
-    recipientFingerprint: bobKeys.keyFingerprint,
+    privateKey: studentKeys.privateKey,
+    recipientId: 'usr-stu-1',
+    recipientFingerprint: studentKeys.keyFingerprint,
   });
 
   assert.equal(new TextDecoder().decode(decrypted.plaintextBytes), plaintextString);
   assert.equal(decrypted.verifiedSha256Hash, expectedSha256);
 
+  // Outsider cannot decrypt
   await assert.rejects(
     () =>
       decryptPayloadWithWebCrypto({
         envelope,
-        privateKey: charlieKeys.privateKey,
-        recipientId: 'usr-charlie',
-        recipientFingerprint: charlieKeys.keyFingerprint,
+        privateKey: outsiderKeys.privateKey,
+        recipientId: 'usr-outsider',
+        recipientFingerprint: outsiderKeys.keyFingerprint,
       }),
     /not listed among the authorized recipients/
   );
 
+  // Faculty grants access to outsider via rewrapAesKeyForRecipients and revokes student1
+  const rewrapped = await rewrapAesKeyForRecipients({
+    envelope,
+    ownerPrivateKey: facultyKeys.privateKey,
+    ownerRecipientId: 'usr-fac-1',
+    ownerFingerprint: facultyKeys.keyFingerprint,
+    targetRecipients: [
+      recipients[0],
+      {
+        id: 'usr-outsider',
+        name: 'Second Student',
+        email: 'student2@jbitdoon.edu.in',
+        role: 'Student',
+        department: 'Computer Science & Engineering',
+        keyFingerprint: outsiderKeys.keyFingerprint,
+        publicKeySpkiBase64: outsiderKeys.publicKeySpkiBase64,
+      },
+    ],
+  });
+  const updatedEnvelope = { ...envelope, wrappedKeys: rewrapped };
+
+  const outsiderDecrypted = await decryptPayloadWithWebCrypto({
+    envelope: updatedEnvelope,
+    privateKey: outsiderKeys.privateKey,
+    recipientId: 'usr-outsider',
+    recipientFingerprint: outsiderKeys.keyFingerprint,
+  });
+  assert.equal(new TextDecoder().decode(outsiderDecrypted.plaintextBytes), plaintextString);
+
+  // Tampered ciphertext is rejected by AES-GCM tag verification
   const rawCipherBytes = base64ToBytes(envelope.rawCiphertextBase64!);
   rawCipherBytes[0] ^= 0xff;
   const tamperedEnvelope = {
@@ -163,9 +206,9 @@ test('encryptPayloadWithWebCrypto and decryptPayloadWithWebCrypto perform full r
     () =>
       decryptPayloadWithWebCrypto({
         envelope: tamperedEnvelope,
-        privateKey: bobKeys.privateKey,
-        recipientId: 'usr-bob',
-        recipientFingerprint: bobKeys.keyFingerprint,
+        privateKey: studentKeys.privateKey,
+        recipientId: 'usr-stu-1',
+        recipientFingerprint: studentKeys.keyFingerprint,
       }),
     /AES-256-GCM authentication failed/
   );
@@ -174,12 +217,13 @@ test('encryptPayloadWithWebCrypto and decryptPayloadWithWebCrypto perform full r
 test('buildEncryptedKeyBackupPayload exports PBKDF2-wrapped backup with JB Institute of Technology, Dehradun branding', async () => {
   const bundle = await generateUserKeyBundle('backup-passphrase-2026');
   const user: UserProfile = {
-    id: 'usr-vance',
-    name: 'Dr. Elena Vance',
-    email: 'e.vance@jbitdoon.edu.in',
+    id: 'usr-fac-1',
+    name: 'Test Faculty',
+    email: 'faculty1@jbitdoon.edu.in',
     role: 'Faculty',
-    department: 'Applied Cryptography',
+    department: 'Department of Computer Science',
     keyFingerprint: bundle.keyFingerprint,
+    publicKeySpkiBase64: bundle.publicKeySpkiBase64,
     vaultUnlockedAt: '07:20',
     publicKey: bundle.publicKey,
     privateKey: bundle.privateKey,
@@ -189,13 +233,12 @@ test('buildEncryptedKeyBackupPayload exports PBKDF2-wrapped backup with JB Insti
   const payload = buildEncryptedKeyBackupPayload(user, '2026-11-25T15:20:00.000Z');
   assert.equal(payload.application, 'CipherHall');
   assert.equal(payload.institution, INSTITUTION_NAME);
-  assert.equal(payload.owner.email, 'e.vance@jbitdoon.edu.in');
+  assert.equal(payload.owner.email, 'faculty1@jbitdoon.edu.in');
   assert.equal(payload.protection.asymmetricAlgorithm, 'RSA-OAEP-2048');
   assert.equal(payload.protection.symmetricAlgorithm, 'AES-256-GCM');
   assert.equal(payload.encryptedPrivateKeyBundle.kdf, 'PBKDF2-SHA256');
   assert.ok(payload.encryptedPrivateKeyBundle.wrappedPrivateKeyBase64.length > 100);
 
-  // Backup bundle can still be unlocked with original passphrase
   const restored = await unlockPrivateKeyWithPassphrase(
     payload.encryptedPrivateKeyBundle,
     'backup-passphrase-2026'
@@ -211,20 +254,20 @@ test('canManageFileAccess and updateFileRecipientAccess enforce Faculty ownershi
     plaintextBytes: new TextEncoder().encode('Confidential Rubric'),
     recipients: [
       {
-        id: 'usr-vance',
-        name: 'Dr. Elena Vance',
-        email: 'e.vance@jbitdoon.edu.in',
+        id: 'usr-fac-1',
+        name: 'Test Faculty',
+        email: 'faculty1@jbitdoon.edu.in',
         role: 'Faculty',
-        department: 'Applied Cryptography',
+        department: 'Department of Computer Science',
         keyFingerprint: facultyKeys.keyFingerprint,
         publicKey: facultyKeys.publicKey,
       },
       {
-        id: 'usr-lin',
-        name: 'Maya Lin',
-        email: 'm.lin@jbitdoon.edu.in',
+        id: 'usr-stu-1',
+        name: 'Test Student',
+        email: 'student1@jbitdoon.edu.in',
         role: 'Student',
-        department: 'Computer Science (M.S.)',
+        department: 'Computer Science & Engineering',
         keyFingerprint: studentKeys.keyFingerprint,
         publicKey: studentKeys.publicKey,
       },
@@ -236,32 +279,33 @@ test('canManageFileAccess and updateFileRecipientAccess enforce Faculty ownershi
     filename: 'CS410_Rubric.pdf',
     fileType: 'PDF',
     sizeBytes: 12400,
-    uploadedBy: 'Dr. Elena Vance',
+    uploaderId: 'usr-fac-1',
+    uploadedBy: 'Test Faculty',
     uploadedByRole: 'Faculty',
-    department: 'Applied Cryptography',
+    department: 'Department of Computer Science',
     uploadedAt: '2026-11-25T10:00:00Z',
     dateLabel: 'Nov 25, 2026',
     sha256Status: 'Verified',
-    decryptedPreviewContent: 'Confidential Rubric',
-    recipients: ['Dr. Elena Vance', 'Maya Lin'],
+    recipientIds: ['usr-fac-1', 'usr-stu-1'],
+    recipients: ['Test Faculty', 'Test Student'],
     crypto: envelope,
   };
 
   const facultyUser: UserProfile = {
-    id: 'usr-vance',
-    name: 'Dr. Elena Vance',
-    email: 'e.vance@jbitdoon.edu.in',
+    id: 'usr-fac-1',
+    name: 'Test Faculty',
+    email: 'faculty1@jbitdoon.edu.in',
     role: 'Faculty',
-    department: 'Applied Cryptography',
+    department: 'Department of Computer Science',
     keyFingerprint: facultyKeys.keyFingerprint,
     vaultUnlockedAt: '07:20',
   };
   const studentUser: UserProfile = {
-    id: 'usr-lin',
-    name: 'Maya Lin',
-    email: 'm.lin@jbitdoon.edu.in',
+    id: 'usr-stu-1',
+    name: 'Test Student',
+    email: 'student1@jbitdoon.edu.in',
     role: 'Student',
-    department: 'Computer Science (M.S.)',
+    department: 'Computer Science & Engineering',
     keyFingerprint: studentKeys.keyFingerprint,
     vaultUnlockedAt: '07:20',
   };
@@ -269,19 +313,18 @@ test('canManageFileAccess and updateFileRecipientAccess enforce Faculty ownershi
   assert.equal(canManageFileAccess(facultyUser, file), true);
   assert.equal(canManageFileAccess(studentUser, file), false);
 
-  const { updatedFile, revokedNames } = updateFileRecipientAccess(file, ['Dr. Elena Vance']);
-  assert.deepEqual(revokedNames, ['Maya Lin']);
-  assert.deepEqual(updatedFile.recipients, ['Dr. Elena Vance']);
+  const { updatedFile, revokedNames } = updateFileRecipientAccess(file, ['Test Faculty']);
+  assert.deepEqual(revokedNames, ['Test Student']);
+  assert.deepEqual(updatedFile.recipients, ['Test Faculty']);
   assert.equal(updatedFile.crypto.wrappedKeys.length, 1);
-  assert.equal(updatedFile.crypto.wrappedKeys[0].recipientName, 'Dr. Elena Vance');
+  assert.equal(updatedFile.crypto.wrappedKeys[0].recipientName, 'Test Faculty');
 
-  // Revoked student can no longer decrypt
   await assert.rejects(
     () =>
       decryptPayloadWithWebCrypto({
         envelope: updatedFile.crypto,
         privateKey: studentKeys.privateKey,
-        recipientId: 'usr-lin',
+        recipientId: 'usr-stu-1',
         recipientFingerprint: studentKeys.keyFingerprint,
       }),
     /not listed among the authorized recipients/
@@ -295,8 +338,8 @@ test('verifyFileIntegrity, filterVaultFiles, and filterActivityEvents work accur
     recipients: [
       {
         id: 'rec-1',
-        name: 'Dr. Elena Vance',
-        email: 'e.vance@jbitdoon.edu.in',
+        name: 'Test Faculty',
+        email: 'faculty1@jbitdoon.edu.in',
         role: 'Faculty',
         department: 'Computer Science',
         keyFingerprint: userKeys.keyFingerprint,
@@ -310,14 +353,15 @@ test('verifyFileIntegrity, filterVaultFiles, and filterActivityEvents work accur
     filename: 'CS410_Midterm_Solutions.pdf',
     fileType: 'PDF',
     sizeBytes: 120000,
-    uploadedBy: 'Dr. Elena Vance',
+    uploaderId: 'rec-1',
+    uploadedBy: 'Test Faculty',
     uploadedByRole: 'Faculty',
     department: 'Computer Science',
     uploadedAt: '2026-11-25T09:00:00Z',
     dateLabel: 'Nov 25, 2026',
     sha256Status: 'Verified',
-    decryptedPreviewContent: 'Solutions',
-    recipients: ['Dr. Elena Vance'],
+    recipientIds: ['rec-1'],
+    recipients: ['Test Faculty'],
     crypto: envelope,
   };
 
@@ -325,7 +369,8 @@ test('verifyFileIntegrity, filterVaultFiles, and filterActivityEvents work accur
     ...cleanFile,
     id: 'f-2',
     filename: 'Thesis_Chapter3_Draft.docx',
-    uploadedBy: 'Jordan Alvarez',
+    uploaderId: 'rec-2',
+    uploadedBy: 'Second Student',
     uploadedByRole: 'Student',
     sha256Status: 'Mismatch',
     crypto: {
@@ -351,7 +396,7 @@ test('verifyFileIntegrity, filterVaultFiles, and filterActivityEvents work accur
       category: 'security',
       title: 'Downloaded encrypted key backup',
       detail: 'Exported passphrase-protected backup file locally.',
-      actorName: 'Dr. Elena Vance',
+      actorName: 'Test Faculty',
       actorRole: 'Faculty',
       timestampLabel: '07:20',
       status: 'success',
@@ -360,8 +405,8 @@ test('verifyFileIntegrity, filterVaultFiles, and filterActivityEvents work accur
       id: 'ev-2',
       category: 'access',
       title: 'Revoked file access',
-      detail: 'Removed Maya Lin from CS410_Midterm_Solutions.pdf.',
-      actorName: 'Dr. Elena Vance',
+      detail: 'Removed Test Student from CS410_Midterm_Solutions.pdf.',
+      actorName: 'Test Faculty',
       actorRole: 'Faculty',
       timestampLabel: '07:22',
       status: 'warning',

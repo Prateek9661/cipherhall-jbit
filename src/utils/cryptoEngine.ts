@@ -184,6 +184,27 @@ export async function generateRsaOaepKeyPair(): Promise<CryptoKeyPair> {
   );
 }
 
+export async function exportPublicKeyToSpkiBase64(publicKey: CryptoKey): Promise<string> {
+  const webCrypto = getWebCrypto();
+  const spki = await webCrypto.subtle.exportKey('spki', publicKey);
+  return bytesToBase64(new Uint8Array(spki));
+}
+
+export async function importPublicKeyFromSpkiBase64(spkiBase64: string): Promise<CryptoKey> {
+  const webCrypto = getWebCrypto();
+  const spkiBytes = base64ToBytes(spkiBase64);
+  return webCrypto.subtle.importKey(
+    'spki',
+    toArrayBuffer(spkiBytes),
+    {
+      name: 'RSA-OAEP',
+      hash: 'SHA-256',
+    },
+    true,
+    ['encrypt', 'wrapKey']
+  );
+}
+
 export async function computePublicKeyFingerprint(publicKey: CryptoKey): Promise<string> {
   const webCrypto = getWebCrypto();
   const spki = await webCrypto.subtle.exportKey('spki', publicKey);
@@ -227,6 +248,7 @@ async function derivePassphraseKek(
 export interface GeneratedUserKeyMaterial {
   publicKey: CryptoKey;
   privateKey: CryptoKey;
+  publicKeySpkiBase64: string;
   keyFingerprint: string;
   protectedPrivateKey: ProtectedPrivateKeyBundle;
   /** RSA-OAEP-2048 public key exported as JWK – safe to store on the server */
@@ -234,7 +256,8 @@ export interface GeneratedUserKeyMaterial {
 }
 
 /**
- * Generates a real RSA-OAEP-2048 (SHA-256) key pair on login/registration,
+ * Generates a real RSA-OAEP-2048 (SHA-256) key pair on registration,
+ * exports the SPKI public key for MongoDB directory storage,
  * wraps the PKCS8 private key with an AES-256-GCM KEK derived from the Vault
  * Passphrase via PBKDF2 (SHA-256), and verifies unwrapping with that passphrase.
  */
@@ -243,6 +266,7 @@ export async function generateUserKeyBundle(
 ): Promise<GeneratedUserKeyMaterial> {
   const webCrypto = getWebCrypto();
   const keyPair = await generateRsaOaepKeyPair();
+  const publicKeySpkiBase64 = await exportPublicKeyToSpkiBase64(keyPair.publicKey);
   const keyFingerprint = await computePublicKeyFingerprint(keyPair.publicKey);
 
   const salt = webCrypto.getRandomValues(new Uint8Array(16));
@@ -277,6 +301,7 @@ export async function generateUserKeyBundle(
   return {
     publicKey: keyPair.publicKey,
     privateKey: unlockedPrivateKey,
+    publicKeySpkiBase64,
     keyFingerprint,
     protectedPrivateKey,
     publicKeyJwk,
@@ -309,8 +334,9 @@ export async function unlockPrivateKeyWithPassphrase(
 }
 
 /**
- * Generates real RSA-OAEP-2048 public keys for mock campus recipients so every
- * recipient selection performs authentic Web Crypto RSA-OAEP-2048 key wrapping.
+ * Imports real registered users' stored RSA-OAEP-2048 SPKI public keys into
+ * Web Crypto CryptoKey instances so AES-256-GCM keys are wrapped exclusively
+ * for real registered campus accounts.
  */
 /**
  * Imports an RSA-OAEP-2048 public key from a JWK object (retrieved from server).
@@ -335,12 +361,82 @@ export async function hydrateRecipientsWithRealKeys(
       if (recipient.publicKey) {
         return recipient;
       }
-      const keyPair = await generateRsaOaepKeyPair();
-      const fingerprint = await computePublicKeyFingerprint(keyPair.publicKey);
+      if (!recipient.publicKeySpkiBase64) {
+        throw new Error(
+          `Registered user ${recipient.name} does not have a valid RSA-OAEP-2048 public key.`
+        );
+      }
+      const importedKey = await importPublicKeyFromSpkiBase64(recipient.publicKeySpkiBase64);
+      const fingerprint =
+        recipient.keyFingerprint || (await computePublicKeyFingerprint(importedKey));
       return {
         ...recipient,
-        publicKey: keyPair.publicKey,
+        publicKey: importedKey,
         keyFingerprint: fingerprint,
+      };
+    })
+  );
+}
+
+/**
+ * Unwraps the file's AES-256-GCM symmetric key with the Faculty uploader's
+ * RSA-OAEP-2048 private key and re-wraps it exclusively for the updated set
+ * of authorized registered recipients (revoking removed recipients and
+ * granting cryptographic access to newly added recipients).
+ */
+export async function rewrapAesKeyForRecipients(options: {
+  envelope: CryptoEnvelope;
+  ownerPrivateKey: CryptoKey;
+  ownerRecipientId: string;
+  ownerFingerprint?: string;
+  targetRecipients: Recipient[];
+}): Promise<WrappedRecipientKey[]> {
+  const webCrypto = getWebCrypto();
+  const { envelope, ownerPrivateKey, ownerRecipientId, ownerFingerprint, targetRecipients } =
+    options;
+
+  if (targetRecipients.length === 0) {
+    throw new Error('At least one authorized person must retain access to this file.');
+  }
+
+  const ownerEntry = envelope.wrappedKeys.find(
+    (entry) =>
+      entry.recipientId === ownerRecipientId ||
+      (ownerFingerprint !== undefined && entry.keyFingerprint === ownerFingerprint)
+  );
+  if (!ownerEntry) {
+    throw new Error('Your RSA-OAEP-2048 key was not found on this file envelope.');
+  }
+
+  const wrappedOwnerBytes = base64ToBytes(ownerEntry.wrappedKeyBase64);
+  const aesKey = await webCrypto.subtle.unwrapKey(
+    'raw',
+    toArrayBuffer(wrappedOwnerBytes),
+    ownerPrivateKey,
+    { name: 'RSA-OAEP' },
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+
+  const hydratedTargets = await hydrateRecipientsWithRealKeys(targetRecipients);
+  return Promise.all(
+    hydratedTargets.map(async (recipient) => {
+      if (!recipient.publicKey) {
+        throw new Error(`Missing RSA-OAEP-2048 public key for ${recipient.name}.`);
+      }
+      const wrappedBuffer = await webCrypto.subtle.wrapKey(
+        'raw',
+        aesKey,
+        recipient.publicKey,
+        { name: 'RSA-OAEP' }
+      );
+      return {
+        recipientId: recipient.id,
+        recipientName: recipient.name,
+        recipientRole: recipient.role,
+        keyFingerprint: recipient.keyFingerprint,
+        wrappedKeyBase64: bytesToBase64(new Uint8Array(wrappedBuffer)),
       };
     })
   );
@@ -668,10 +764,11 @@ export function updateFileRecipientAccess(
 }
 
 export function canManageFileAccess(user: UserProfile, file: VaultFile): boolean {
-  return (
-    user.role === 'Faculty' &&
-    file.uploadedBy.trim().toLowerCase() === user.name.trim().toLowerCase()
-  );
+  if (user.role !== 'Faculty') return false;
+  if (file.uploaderId) {
+    return file.uploaderId === user.id;
+  }
+  return file.uploadedBy.trim().toLowerCase() === user.name.trim().toLowerCase();
 }
 
 export function filterActivityEvents(

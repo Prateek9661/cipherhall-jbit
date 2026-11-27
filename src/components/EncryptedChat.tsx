@@ -6,21 +6,21 @@ import {
   Download,
   FileText,
   Lock,
+  MessageSquareLock,
   Paperclip,
   Search,
   Send,
   ShieldCheck,
   User,
-  Users,
   X,
 } from 'lucide-react';
 import type { ChatMessage, ChatThread, VaultFile } from '../types/vault';
-import { formatByteSize } from '../utils/cryptoEngine';
+import { formatByteSize, INSTITUTION_NAME } from '../utils/cryptoEngine';
 import { SecurityTooltip } from './SecurityTooltip';
 
 interface EncryptedChatProps {
   threads: ChatThread[];
-  activeThreadId: string;
+  activeThreadId: string | null;
   selectedMessageId: string | null;
   vaultFiles: VaultFile[];
   onSelectThread: (threadId: string) => void;
@@ -51,6 +51,7 @@ export function EncryptedChat({
   const [threadQuery, setThreadQuery] = useState('');
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
   const [mobileShowThread, setMobileShowThread] = useState(false);
   const [attachPickerOpen, setAttachPickerOpen] = useState(false);
   const [attachedFile, setAttachedFile] = useState<VaultFile | null>(null);
@@ -66,21 +67,18 @@ export function EncryptedChat({
     if (!q) return threads;
     return threads.filter(
       (t) =>
-        t.title.toLowerCase().includes(q) || t.subtitle.toLowerCase().includes(q)
+        t.title.toLowerCase().includes(q) ||
+        t.subtitle.toLowerCase().includes(q) ||
+        (t.participantEmail?.toLowerCase().includes(q) ?? false) ||
+        (t.participantRole?.toLowerCase().includes(q) ?? false)
     );
   }, [threads, threadQuery]);
 
-  const directThreads = useMemo(
-    () => filteredThreads.filter((t) => t.type === 'direct'),
-    [filteredThreads]
-  );
-  const groupThreads = useMemo(
-    () => filteredThreads.filter((t) => t.type === 'group'),
-    [filteredThreads]
-  );
-
   const activeThread = useMemo(
-    () => threads.find((t) => t.id === activeThreadId) ?? threads[0],
+    () =>
+      (activeThreadId ? threads.find((t) => t.id === activeThreadId) : undefined) ??
+      threads[0] ??
+      null,
     [threads, activeThreadId]
   );
 
@@ -92,6 +90,7 @@ export function EncryptedChat({
     onSelectThread(threadId);
     setMobileShowThread(true);
     setAttachPickerOpen(false);
+    setSendError(null);
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -99,13 +98,19 @@ export function EncryptedChat({
     const trimmed = draft.trim();
     if ((!trimmed && !attachedFile) || !activeThread || isSending) return;
     setIsSending(true);
+    setSendError(null);
     try {
       const resolvedText =
-        trimmed || (attachedFile ? `Shared an encrypted vault document: ${attachedFile.filename}` : '');
+        trimmed ||
+        (attachedFile ? `Shared an encrypted vault document: ${attachedFile.filename}` : '');
       await onSendMessage(activeThread.id, resolvedText, attachedFile ?? undefined);
       setDraft('');
       setAttachedFile(null);
       setAttachPickerOpen(false);
+    } catch (err) {
+      setSendError(
+        err instanceof Error ? err.message : 'Unable to encrypt and send message.'
+      );
     } finally {
       setIsSending(false);
     }
@@ -131,7 +136,7 @@ export function EncryptedChat({
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-[#0B0F17]">
-      {/* Left Conversation List (Full-width on narrow screens when list is active; fixed split pane on md+) */}
+      {/* Left Conversation List (Registered Campus Contacts Only) */}
       <aside
         aria-label="Encrypted conversations"
         className={`${
@@ -148,22 +153,35 @@ export function EncryptedChat({
               type="search"
               value={threadQuery}
               onChange={(e) => setThreadQuery(e.target.value)}
-              aria-label="Search chats and class groups"
-              placeholder="Search chats or class groups..."
+              aria-label="Search registered contacts"
+              placeholder="Search name, email, or role..."
               className="w-full h-9 pl-9 pr-3 rounded-lg bg-[#111824] border border-slate-800 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
             />
           </div>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-5">
-          {/* 1-on-1 Faculty & Student Chats */}
-          <div>
-            <h2 className="px-2.5 pb-1.5 text-xs font-medium text-slate-500 flex items-center justify-between">
-              <span>Direct Messages (1-on-1)</span>
-              <span className="font-mono tabular-nums">{directThreads.length}</span>
-            </h2>
+        <div className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-3">
+          <h2 className="px-2.5 pt-1 text-xs font-medium text-slate-500 flex items-center justify-between">
+            <span>Registered Campus Contacts</span>
+            <span className="font-mono tabular-nums">{filteredThreads.length}</span>
+          </h2>
+
+          {threads.length === 0 ? (
+            <div className="px-3 py-8 text-center">
+              <User className="h-7 w-7 text-slate-600 mx-auto" aria-hidden="true" />
+              <p className="mt-2 text-xs font-medium text-slate-300">No campus contacts yet</p>
+              <p className="mt-1 text-xs text-slate-500 leading-relaxed">
+                Other registered students and faculty will appear here once they create an
+                account.
+              </p>
+            </div>
+          ) : filteredThreads.length === 0 ? (
+            <p className="px-3 py-6 text-center text-xs text-slate-500">
+              No contacts match “{threadQuery}”.
+            </p>
+          ) : (
             <div className="space-y-1">
-              {directThreads.map((thread) => {
+              {filteredThreads.map((thread) => {
                 const isActive = thread.id === activeThread?.id;
                 return (
                   <button
@@ -185,17 +203,25 @@ export function EncryptedChat({
                         <span className="text-sm font-medium text-slate-100 truncate">
                           {thread.title}
                         </span>
-                        <span className="font-mono text-[11px] text-slate-500 tabular-nums shrink-0">
-                          {thread.lastActivity}
-                        </span>
+                        {thread.participantRole && (
+                          <span
+                            className={`px-1.5 py-0.5 text-[10px] font-medium rounded border shrink-0 ${
+                              thread.participantRole === 'Faculty'
+                                ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                : 'bg-blue-500/10 text-blue-300 border-blue-500/30'
+                            }`}
+                          >
+                            {thread.participantRole}
+                          </span>
+                        )}
                       </div>
                       <div className="mt-0.5 flex items-center justify-between gap-2">
                         <span className="text-xs text-slate-400 truncate">
-                          {thread.subtitle}
+                          {thread.participantEmail ?? thread.subtitle}
                         </span>
-                        {thread.unreadCount > 0 && (
-                          <span className="font-mono text-[11px] font-semibold text-blue-400 tabular-nums shrink-0">
-                            {thread.unreadCount} new
+                        {thread.lastActivity && (
+                          <span className="font-mono text-[11px] text-slate-500 tabular-nums shrink-0">
+                            {thread.lastActivity}
                           </span>
                         )}
                       </div>
@@ -204,68 +230,30 @@ export function EncryptedChat({
                 );
               })}
             </div>
-          </div>
-
-          {/* Class Groups */}
-          <div>
-            <h2 className="px-2.5 pb-1.5 text-xs font-medium text-slate-500 flex items-center justify-between">
-              <span>Class Groups</span>
-              <span className="font-mono tabular-nums">{groupThreads.length}</span>
-            </h2>
-            <div className="space-y-1">
-              {groupThreads.map((thread) => {
-                const isActive = thread.id === activeThread?.id;
-                return (
-                  <button
-                    key={thread.id}
-                    type="button"
-                    onClick={() => handleChooseThread(thread.id)}
-                    aria-current={isActive ? 'true' : undefined}
-                    className={`w-full text-left px-2.5 py-2.5 rounded-lg transition-colors flex items-start gap-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-                      isActive
-                        ? 'bg-slate-800/90 text-slate-50'
-                        : 'text-slate-300 hover:bg-slate-800/40'
-                    }`}
-                  >
-                    <div className="h-8 w-8 rounded-lg bg-blue-600/15 border border-blue-500/30 flex items-center justify-center text-blue-400 shrink-0 mt-0.5">
-                      <Users className="h-4 w-4" aria-hidden="true" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-sm font-medium text-slate-100 truncate">
-                          {thread.title}
-                        </span>
-                        <span className="font-mono text-[11px] text-slate-500 tabular-nums shrink-0">
-                          {thread.lastActivity}
-                        </span>
-                      </div>
-                      <div className="mt-0.5 flex items-center justify-between gap-2">
-                        <span className="text-xs text-slate-400 truncate">
-                          {thread.subtitle}
-                        </span>
-                        {thread.unreadCount > 0 && (
-                          <span className="font-mono text-[11px] font-semibold text-blue-400 tabular-nums shrink-0">
-                            {thread.unreadCount} new
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {filteredThreads.length === 0 && (
-            <p className="px-3 py-6 text-center text-xs text-slate-500">
-              No chats match “{threadQuery}”.
-            </p>
           )}
         </div>
       </aside>
 
       {/* Right Full-Height Live Chat Window with Pinned Bottom Composer */}
-      {activeThread && (
+      {!activeThread ? (
+        <section
+          aria-label="Encrypted messaging empty state"
+          className={`${
+            mobileShowThread ? 'flex' : 'hidden md:flex'
+          } flex-1 flex-col items-center justify-center p-8 text-center bg-[#0B0F17]`}
+        >
+          <div className="h-12 w-12 rounded-xl bg-[#111824] border border-slate-800 flex items-center justify-center text-slate-400">
+            <MessageSquareLock className="h-6 w-6" aria-hidden="true" />
+          </div>
+          <h1 className="mt-4 font-display text-lg font-semibold text-slate-100">
+            No encrypted conversations yet
+          </h1>
+          <p className="mt-1.5 text-sm text-slate-400 max-w-md leading-relaxed">
+            Once other students or faculty from {INSTITUTION_NAME} register on CipherHall,
+            they will appear in your contacts list for end-to-end encrypted messaging.
+          </p>
+        </section>
+      ) : (
         <section
           aria-label={`Conversation with ${activeThread.title}`}
           className={`${
@@ -302,7 +290,7 @@ export function EncryptedChat({
                   )}
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5 truncate">
-                  {activeThread.subtitle}
+                  {activeThread.participantEmail ?? activeThread.subtitle}
                 </p>
               </div>
             </div>
@@ -343,124 +331,150 @@ export function EncryptedChat({
             </div>
           )}
 
+          {sendError && (
+            <div
+              role="alert"
+              className="px-4 sm:px-6 py-2 border-b border-rose-500/30 bg-rose-950/35 text-xs text-rose-200 flex items-center justify-between gap-3 shrink-0"
+            >
+              <span>{sendError}</span>
+              <button
+                type="button"
+                onClick={() => setSendError(null)}
+                className="text-slate-400 hover:text-slate-100 whitespace-nowrap shrink-0"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
           {/* Independently Scrollable Messages Stream */}
           <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-5 space-y-5">
-            {activeThread.messages.map((message) => {
-              const isSelected = message.id === selectedMessageId;
-              const isSelf = Boolean(message.isCurrentUser);
+            {activeThread.messages.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center py-12">
+                <Lock className="h-7 w-7 text-slate-600" aria-hidden="true" />
+                <p className="mt-3 text-sm font-medium text-slate-200">
+                  No messages with {activeThread.title} yet
+                </p>
+                <p className="mt-1 text-xs text-slate-400 max-w-sm leading-relaxed">
+                  Send an end-to-end encrypted message or attach a Vault file below to start
+                  this conversation.
+                </p>
+              </div>
+            ) : (
+              activeThread.messages.map((message) => {
+                const isSelected = message.id === selectedMessageId;
+                const isSelf = Boolean(message.isCurrentUser);
 
-              return (
-                <div
-                  key={message.id}
-                  className={`flex flex-col ${isSelf ? 'items-end' : 'items-start'}`}
-                >
-                  <div className="flex items-center gap-2 mb-1.5 px-1 text-xs">
-                    <span className="font-medium text-slate-200">{message.senderName}</span>
-                    <span
-                      className={`px-1.5 py-0.5 text-[10px] font-medium rounded border ${
-                        message.senderRole === 'Faculty'
-                          ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
-                          : 'bg-blue-500/10 text-blue-300 border-blue-500/30'
+                return (
+                  <div
+                    key={message.id}
+                    className={`flex flex-col ${isSelf ? 'items-end' : 'items-start'}`}
+                  >
+                    <div className="flex items-center gap-2 mb-1.5 px-1 text-xs">
+                      <span className="font-medium text-slate-200">{message.senderName}</span>
+                      <span
+                        className={`px-1.5 py-0.5 text-[10px] font-medium rounded border ${
+                          message.senderRole === 'Faculty'
+                            ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                            : 'bg-blue-500/10 text-blue-300 border-blue-500/30'
+                        }`}
+                      >
+                        {message.senderRole}
+                      </span>
+                      <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                        {message.timestamp}
+                      </span>
+                      <Lock className="h-3 w-3 text-slate-500" aria-label="Encrypted message" />
+                    </div>
+
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => onSelectMessage(message, activeThread.title)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          onSelectMessage(message, activeThread.title);
+                        }
+                      }}
+                      aria-pressed={isSelected}
+                      aria-label={`Message from ${message.senderName}`}
+                      className={`text-left max-w-xl rounded-xl px-4 py-3 border transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                        isSelected
+                          ? 'bg-blue-600/15 border-blue-500/70 text-slate-100'
+                          : isSelf
+                          ? 'bg-[#152033] border-slate-700/80 hover:border-slate-600 text-slate-100'
+                          : 'bg-[#111824] border-slate-800/90 hover:border-slate-700 text-slate-200'
                       }`}
                     >
-                      {message.senderRole}
-                    </span>
-                    <span className="font-mono text-[11px] text-slate-500 tabular-nums">
-                      {message.timestamp}
-                    </span>
-                    <Lock
-                      className="h-3 w-3 text-slate-500"
-                      aria-label="Encrypted message"
-                    />
-                  </div>
+                      <p className="text-sm leading-relaxed">{message.text}</p>
 
-                  <div
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => onSelectMessage(message, activeThread.title)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        onSelectMessage(message, activeThread.title);
-                      }
-                    }}
-                    aria-pressed={isSelected}
-                    aria-label={`Message from ${message.senderName}`}
-                    className={`text-left max-w-xl rounded-xl px-4 py-3 border transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-                      isSelected
-                        ? 'bg-blue-600/15 border-blue-500/70 text-slate-100'
-                        : isSelf
-                        ? 'bg-[#152033] border-slate-700/80 hover:border-slate-600 text-slate-100'
-                        : 'bg-[#111824] border-slate-800/90 hover:border-slate-700 text-slate-200'
-                    }`}
-                  >
-                    <p className="text-sm leading-relaxed">{message.text}</p>
-
-                    {message.attachedFile && (
-                      <div className="mt-3 p-3 rounded-lg bg-[#0B0F17]/90 border border-slate-800 flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <div className="h-8 w-8 rounded-md bg-blue-600/15 border border-blue-500/30 flex items-center justify-center text-blue-400 shrink-0">
-                            <FileText className="h-4 w-4" aria-hidden="true" />
-                          </div>
-                          <div className="min-w-0">
-                            <p className="text-xs font-medium text-slate-100 truncate">
-                              {message.attachedFile.filename}
-                            </p>
-                            <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-400">
-                              <span className="tabular-nums">
-                                {formatByteSize(message.attachedFile.sizeBytes)}
-                              </span>
-                              <span>·</span>
-                              <span
-                                className={`inline-flex items-center gap-1 ${
-                                  message.attachedFile.sha256Status === 'Verified'
-                                    ? 'text-emerald-400'
-                                    : message.attachedFile.sha256Status === 'Pending'
-                                    ? 'text-amber-300'
-                                    : 'text-rose-400'
-                                }`}
-                              >
-                                {message.attachedFile.sha256Status === 'Verified' ? (
-                                  <ShieldCheck className="h-3 w-3" aria-hidden="true" />
-                                ) : message.attachedFile.sha256Status === 'Pending' ? (
-                                  <Clock className="h-3 w-3" aria-hidden="true" />
-                                ) : (
-                                  <AlertTriangle className="h-3 w-3" aria-hidden="true" />
-                                )}
-                                <span>
-                                  {message.attachedFile.sha256Status === 'Mismatch'
-                                    ? 'Integrity Alert'
-                                    : message.attachedFile.sha256Status}
+                      {message.attachedFile && (
+                        <div className="mt-3 p-3 rounded-lg bg-[#0B0F17]/90 border border-slate-800 flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <div className="h-8 w-8 rounded-md bg-blue-600/15 border border-blue-500/30 flex items-center justify-center text-blue-400 shrink-0">
+                              <FileText className="h-4 w-4" aria-hidden="true" />
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-xs font-medium text-slate-100 truncate">
+                                {message.attachedFile.filename}
+                              </p>
+                              <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-400">
+                                <span className="tabular-nums">
+                                  {formatByteSize(message.attachedFile.sizeBytes)}
                                 </span>
-                              </span>
+                                <span>·</span>
+                                <span
+                                  className={`inline-flex items-center gap-1 ${
+                                    message.attachedFile.sha256Status === 'Verified'
+                                      ? 'text-emerald-400'
+                                      : message.attachedFile.sha256Status === 'Pending'
+                                      ? 'text-amber-300'
+                                      : 'text-rose-400'
+                                  }`}
+                                >
+                                  {message.attachedFile.sha256Status === 'Verified' ? (
+                                    <ShieldCheck className="h-3 w-3" aria-hidden="true" />
+                                  ) : message.attachedFile.sha256Status === 'Pending' ? (
+                                    <Clock className="h-3 w-3" aria-hidden="true" />
+                                  ) : (
+                                    <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                                  )}
+                                  <span>
+                                    {message.attachedFile.sha256Status === 'Mismatch'
+                                      ? 'Integrity Alert'
+                                      : message.attachedFile.sha256Status}
+                                  </span>
+                                </span>
+                              </div>
                             </div>
                           </div>
-                        </div>
 
-                        {onDownloadVaultFile && (
-                          <button
-                            type="button"
-                            disabled={downloadingFileId === message.attachedFile.fileId}
-                            onClick={(e) =>
-                              void handleDownloadAttachment(e, message.attachedFile!.fileId)
-                            }
-                            aria-label={`Decrypt & Download ${message.attachedFile.filename}`}
-                            className="h-8 px-2.5 rounded-md border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-xs font-medium text-slate-100 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
-                          >
-                            <Download className="h-3.5 w-3.5 text-blue-400" aria-hidden="true" />
-                            <span>
-                              {downloadingFileId === message.attachedFile.fileId
-                                ? 'Decrypting…'
-                                : 'Decrypt'}
-                            </span>
-                          </button>
-                        )}
-                      </div>
-                    )}
+                          {onDownloadVaultFile && (
+                            <button
+                              type="button"
+                              disabled={downloadingFileId === message.attachedFile.fileId}
+                              onClick={(e) =>
+                                void handleDownloadAttachment(e, message.attachedFile!.fileId)
+                              }
+                              aria-label={`Decrypt & Download ${message.attachedFile.filename}`}
+                              className="h-8 px-2.5 rounded-md border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-xs font-medium text-slate-100 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                            >
+                              <Download className="h-3.5 w-3.5 text-blue-400" aria-hidden="true" />
+                              <span>
+                                {downloadingFileId === message.attachedFile.fileId
+                                  ? 'Decrypting…'
+                                  : 'Decrypt'}
+                              </span>
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
             <div ref={messagesEndRef} />
           </div>
 
@@ -487,42 +501,48 @@ export function EncryptedChat({
                   </button>
                 </div>
                 <div className="max-h-56 overflow-y-auto divide-y divide-slate-800/70">
-                  {vaultFiles.map((file) => {
-                    const isPicked = attachedFile?.id === file.id;
-                    return (
-                      <button
-                        key={file.id}
-                        type="button"
-                        onClick={() => {
-                          setAttachedFile(file);
-                          setAttachPickerOpen(false);
-                        }}
-                        className={`w-full text-left px-3.5 py-2.5 flex items-center justify-between gap-3 transition-colors ${
-                          isPicked ? 'bg-blue-600/15' : 'hover:bg-slate-800/50'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <FileText
-                            className="h-4 w-4 text-blue-400 shrink-0"
-                            aria-hidden="true"
-                          />
-                          <div className="min-w-0">
-                            <p className="text-xs font-medium text-slate-100 truncate">
-                              {file.filename}
-                            </p>
-                            <p className="text-[11px] text-slate-400 truncate">
-                              {formatByteSize(file.sizeBytes)} · {file.uploadedBy}
-                            </p>
+                  {vaultFiles.length === 0 ? (
+                    <p className="px-3.5 py-6 text-center text-xs text-slate-400">
+                      No encrypted files in your Document Vault yet.
+                    </p>
+                  ) : (
+                    vaultFiles.map((file) => {
+                      const isPicked = attachedFile?.id === file.id;
+                      return (
+                        <button
+                          key={file.id}
+                          type="button"
+                          onClick={() => {
+                            setAttachedFile(file);
+                            setAttachPickerOpen(false);
+                          }}
+                          className={`w-full text-left px-3.5 py-2.5 flex items-center justify-between gap-3 transition-colors ${
+                            isPicked ? 'bg-blue-600/15' : 'hover:bg-slate-800/50'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <FileText
+                              className="h-4 w-4 text-blue-400 shrink-0"
+                              aria-hidden="true"
+                            />
+                            <div className="min-w-0">
+                              <p className="text-xs font-medium text-slate-100 truncate">
+                                {file.filename}
+                              </p>
+                              <p className="text-[11px] text-slate-400 truncate">
+                                {formatByteSize(file.sizeBytes)} · {file.uploadedBy}
+                              </p>
+                            </div>
                           </div>
-                        </div>
-                        {file.sha256Status === 'Verified' && (
-                          <span className="text-[11px] font-medium text-emerald-400 shrink-0">
-                            Verified
-                          </span>
-                        )}
-                      </button>
-                    );
-                  })}
+                          {file.sha256Status === 'Verified' && (
+                            <span className="text-[11px] font-medium text-emerald-400 shrink-0">
+                              Verified
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })
+                  )}
                 </div>
               </div>
             )}

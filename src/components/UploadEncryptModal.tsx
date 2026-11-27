@@ -1,15 +1,20 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { FileUp, Loader2, Lock, ShieldCheck, X } from 'lucide-react';
-import type { Recipient, UserProfile, VaultFile } from '../types/vault';
-import { encryptPayloadWithWebCrypto } from '../utils/cryptoEngine';
-import { uploadEncryptedFile } from '../utils/apiClient';
+import type { CryptoEnvelope, Recipient, UserProfile } from '../types/vault';
+import { encryptPayloadWithWebCrypto, INSTITUTION_NAME } from '../utils/cryptoEngine';
 
 interface UploadEncryptModalProps {
   open: boolean;
   onClose: () => void;
   recipients: Recipient[];
   currentUser: UserProfile;
-  onFileEncrypted: (newFile: VaultFile) => void;
+  onUploadEncryptedFile: (payload: {
+    filename: string;
+    mimeType?: string;
+    sizeBytes: number;
+    recipientIds: string[];
+    crypto: CryptoEnvelope;
+  }) => Promise<void>;
 }
 
 export function UploadEncryptModal({
@@ -17,7 +22,7 @@ export function UploadEncryptModal({
   onClose,
   recipients,
   currentUser,
-  onFileEncrypted,
+  onUploadEncryptedFile,
 }: UploadEncryptModalProps) {
   const [filename, setFilename] = useState('');
   const [selectedFileBytes, setSelectedFileBytes] = useState<Uint8Array | null>(null);
@@ -26,50 +31,46 @@ export function UploadEncryptModal({
   const [isEncrypting, setIsEncrypting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Ensure the active user is always selectable with their real RSA-OAEP-2048 public key
-  const effectiveRecipients = useMemo<Recipient[]>(() => {
-    const existingMatch = recipients.some(
-      (r) => r.id === currentUser.id || r.email.toLowerCase() === currentUser.email.toLowerCase()
+  // Use ONLY real registered users returned by the backend API
+  const registeredUsers = useMemo<Recipient[]>(() => {
+    const mapped = recipients.map((r) =>
+      r.id === currentUser.id
+        ? {
+            ...r,
+            publicKey: currentUser.publicKey ?? r.publicKey,
+            publicKeySpkiBase64: currentUser.publicKeySpkiBase64 ?? r.publicKeySpkiBase64,
+          }
+        : r
     );
-    if (existingMatch) {
-      return recipients.map((r) =>
-        r.id === currentUser.id || r.email.toLowerCase() === currentUser.email.toLowerCase()
-          ? {
-              ...r,
-              id: currentUser.id,
-              name: currentUser.name,
-              role: currentUser.role,
-              keyFingerprint: currentUser.keyFingerprint,
-              publicKey: currentUser.publicKey ?? r.publicKey,
-            }
-          : r
-      );
-    }
-    return [
-      {
+    const hasSelf = mapped.some((r) => r.id === currentUser.id);
+    if (!hasSelf) {
+      mapped.unshift({
         id: currentUser.id,
         name: currentUser.name,
         email: currentUser.email,
         role: currentUser.role,
         department: currentUser.department,
         keyFingerprint: currentUser.keyFingerprint,
+        publicKeySpkiBase64: currentUser.publicKeySpkiBase64,
         publicKey: currentUser.publicKey,
-      },
-      ...recipients,
-    ];
+      });
+    }
+    // Sort current user first, then alphabetically by full name
+    return mapped.sort((a, b) => {
+      if (a.id === currentUser.id) return -1;
+      if (b.id === currentUser.id) return 1;
+      return a.name.localeCompare(b.name);
+    });
   }, [recipients, currentUser]);
 
   const [selectedRecipientIds, setSelectedRecipientIds] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open) return;
-    // Default select current user + first faculty/other peer
-    const defaults = new Set<string>([currentUser.id]);
-    const peer = effectiveRecipients.find((r) => r.id !== currentUser.id);
-    if (peer) defaults.add(peer.id);
-    setSelectedRecipientIds(Array.from(defaults));
+    // Default select current user so they can always decrypt their own upload
+    setSelectedRecipientIds([currentUser.id]);
     setError(null);
-  }, [open, currentUser.id, effectiveRecipients]);
+  }, [open, currentUser.id]);
 
   useEffect(() => {
     if (!open) return;
@@ -111,13 +112,17 @@ export function UploadEncryptModal({
       return;
     }
     if (selectedRecipientIds.length === 0) {
-      setError('Select at least one Faculty or Student recipient to wrap the AES key.');
+      setError('Select at least one registered Student or Faculty recipient.');
       return;
     }
 
-    const chosenRecipients = effectiveRecipients.filter((r) =>
+    const chosenRecipients = registeredUsers.filter((r) =>
       selectedRecipientIds.includes(r.id)
     );
+    if (chosenRecipients.length === 0) {
+      setError('No valid registered recipients selected.');
+      return;
+    }
 
     const fallbackNote =
       plaintextNote.trim() ||
@@ -144,58 +149,13 @@ export function UploadEncryptModal({
         encryptedAt: `${now.toISOString().replace('T', ' ').slice(0, 19)} UTC`,
       });
 
-      const extension = cleanedFilename.includes('.')
-        ? cleanedFilename.split('.').pop()?.toUpperCase() ?? 'FILE'
-        : 'FILE';
-
-      const formattedDate = now.toLocaleDateString('en-US', {
-        month: 'short',
-        day: '2-digit',
-        year: 'numeric',
-      });
-
-      const newFile: VaultFile = {
-        id: `file-${now.getTime()}`,
+      await onUploadEncryptedFile({
         filename: cleanedFilename,
-        fileType: extension,
         mimeType: resolvedMime,
         sizeBytes: plaintextBytes.byteLength,
-        uploadedBy: currentUser.name,
-        uploadedByRole: currentUser.role,
-        department: currentUser.department,
-        uploadedAt: now.toISOString(),
-        dateLabel: formattedDate,
-        sha256Status: 'Verified',
-        decryptedPreviewContent: fallbackNote,
-        recipients: chosenRecipients.map((r) => r.name),
+        recipientIds: chosenRecipients.map((r) => r.id),
         crypto: envelope,
-      };
-
-      // ── Upload encrypted blob to server (best-effort) ──────────────────────
-      // The raw ciphertext blob (AES-256-GCM) is sent. The server NEVER
-      // decrypts it. If upload fails, the file is still available locally.
-      try {
-        const serverFile = await uploadEncryptedFile(
-          selectedFileBytes && selectedFileBytes.byteLength > 0 ? selectedFileBytes : null,
-          {
-            filename: cleanedFilename,
-            fileType: extension,
-            mimeType: resolvedMime,
-            sizeBytes: plaintextBytes.byteLength,
-            department: currentUser.department,
-            recipients: chosenRecipients.map((r) => r.name),
-            authorizedUserIds: chosenRecipients
-              .map((r) => r.id)
-              .filter((id) => id && !id.startsWith('usr-')), // only real server IDs
-            cryptoEnvelope: envelope,
-          }
-        );
-        // Use server-assigned ID so future fetches match
-        onFileEncrypted({ ...newFile, id: serverFile.id });
-      } catch {
-        // Server upload failed (offline / not running) – use local-only file
-        onFileEncrypted(newFile);
-      }
+      });
 
       setFilename('');
       setSelectedFileBytes(null);
@@ -206,7 +166,7 @@ export function UploadEncryptModal({
       setError(
         err instanceof Error
           ? err.message
-          : 'Web Crypto encryption failed. Please try again.'
+          : 'Web Crypto encryption or upload failed. Please try again.'
       );
     } finally {
       setIsEncrypting(false);
@@ -238,8 +198,8 @@ export function UploadEncryptModal({
               Upload &amp; Encrypt Document
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Browser-native AES-256-GCM encryption with unique RSA-OAEP-2048 key wrapping per
-              recipient.
+              Encrypted on your device with AES-256-GCM and locked with each recipient’s
+              RSA-OAEP-2048 public key.
             </p>
           </div>
           <button
@@ -271,22 +231,18 @@ export function UploadEncryptModal({
                   setFilename(e.target.value);
                   if (error) setError(null);
                 }}
-                placeholder="e.g. CS410_Lab08_Submission.pdf"
+                placeholder="e.g. Lab_Assignment_Report.pdf"
                 className="flex-1 h-10 px-3.5 rounded-lg bg-[#0B0F17] border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
               />
               <label className="h-10 px-3.5 rounded-lg border border-slate-700 bg-slate-800/70 hover:bg-slate-800 text-xs font-medium text-slate-200 transition-colors inline-flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap shrink-0">
                 <FileUp className="h-4 w-4 text-blue-400" aria-hidden="true" />
                 <span>Browse File</span>
-                <input
-                  type="file"
-                  onChange={handleFileInputChange}
-                  className="sr-only"
-                />
+                <input type="file" onChange={handleFileInputChange} className="sr-only" />
               </label>
             </div>
             {selectedFileBytes && (
               <p className="mt-1.5 text-xs font-mono text-emerald-400">
-                Loaded {selectedFileBytes.byteLength.toLocaleString()} raw file bytes for real
+                Loaded {selectedFileBytes.byteLength.toLocaleString()} bytes locally for
                 AES-256-GCM encryption.
               </p>
             )}
@@ -300,7 +256,7 @@ export function UploadEncryptModal({
             >
               Plaintext Content / Abstract{' '}
               <span className="text-xs font-normal text-slate-500">
-                (encrypted if no file chosen)
+                (encrypted if no local file is attached)
               </span>
             </label>
             <textarea
@@ -308,22 +264,22 @@ export function UploadEncryptModal({
               rows={3}
               value={plaintextNote}
               onChange={(e) => setPlaintextNote(e.target.value)}
-              placeholder="Enter plaintext content to encrypt with AES-256-GCM and verify on local decryption..."
+              placeholder="Enter document text to encrypt locally with AES-256-GCM..."
               className="w-full px-3.5 py-2.5 rounded-lg bg-[#0B0F17] border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 resize-none"
             />
           </div>
 
-          {/* Multi-Recipient Checkboxes */}
+          {/* Multi-Recipient Checkboxes (Strictly Real Registered Users) */}
           <div>
             <div className="flex items-center justify-between gap-2 mb-2">
               <span className="text-sm font-medium text-slate-200">
-                Authorized Recipients ({selectedRecipientIds.length} selected)
+                Registered Recipients ({selectedRecipientIds.length} selected)
               </span>
               <div className="flex items-center gap-3 text-xs">
                 <button
                   type="button"
                   onClick={() => {
-                    setSelectedRecipientIds(effectiveRecipients.map((r) => r.id));
+                    setSelectedRecipientIds(registeredUsers.map((r) => r.id));
                     if (error) setError(null);
                   }}
                   className="text-blue-400 hover:text-blue-300 font-medium whitespace-nowrap"
@@ -341,7 +297,7 @@ export function UploadEncryptModal({
             </div>
 
             <div className="rounded-lg border border-slate-800 bg-[#0B0F17] divide-y divide-slate-800/80 max-h-64 overflow-y-auto">
-              {effectiveRecipients.map((recipient) => {
+              {registeredUsers.map((recipient) => {
                 const checked = selectedRecipientIds.includes(recipient.id);
                 const isSelf = recipient.id === currentUser.id;
                 return (
@@ -367,9 +323,7 @@ export function UploadEncryptModal({
                             </span>
                           )}
                         </p>
-                        <p className="text-xs text-slate-500 truncate">
-                          {recipient.department}
-                        </p>
+                        <p className="text-xs text-slate-400 truncate">{recipient.email}</p>
                       </div>
                     </div>
                     <span
@@ -385,6 +339,13 @@ export function UploadEncryptModal({
                 );
               })}
             </div>
+
+            {registeredUsers.length === 1 && (
+              <p className="mt-2 text-xs text-slate-500">
+                Other {INSTITUTION_NAME} students and faculty will appear here once they
+                create an account.
+              </p>
+            )}
           </div>
 
           {/* Encryption Pipeline Summary */}
@@ -423,7 +384,7 @@ export function UploadEncryptModal({
               {isEncrypting ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  <span>Encrypting…</span>
+                  <span>Encrypting &amp; Uploading…</span>
                 </>
               ) : (
                 <>
